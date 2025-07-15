@@ -1,6 +1,9 @@
 # 环境变量文件 (包含API密钥)
 .env
 
+# Cursor/IDE相关
+.specstory/
+
 # Python相关
 __pycache__/
 *.py[cod]
