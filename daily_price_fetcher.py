@@ -65,17 +65,27 @@ class DailyPriceFetcher:
         except Exception as e:
             self.logger.error(f"Failed to save processed symbols: {e}")
     
-    def get_alert_files(self, days_back: int = 7) -> List[Path]:
-        """Get alert JSON files from the last N days"""
+    def get_alert_files(self, days_back: int = None) -> List[Path]:
+        """Get all alert JSON files with alerts_yyyy-mm-dd.json format"""
         files = []
-        for i in range(days_back):
-            date = datetime.now() - timedelta(days=i)
-            date_str = date.strftime('%Y-%m-%d')
-            alert_file = self.alert_data_dir / f"alerts_{date_str}.json"
-            if alert_file.exists():
-                files.append(alert_file)
         
-        self.logger.info(f"Found {len(files)} alert files from last {days_back} days")
+        if self.alert_data_dir.exists():
+            # Get all files matching the pattern alerts_yyyy-mm-dd.json
+            for file_path in self.alert_data_dir.glob("alerts_*.json"):
+                # Verify the filename matches the expected date format
+                filename = file_path.name
+                if filename.startswith('alerts_') and filename.endswith('.json'):
+                    try:
+                        date_part = filename.replace('alerts_', '').replace('.json', '')
+                        datetime.strptime(date_part, '%Y-%m-%d')  # Validate date format
+                        files.append(file_path)
+                    except ValueError:
+                        continue  # Skip files that don't match the date format
+        
+        # Sort files by date (newest first)
+        files.sort(reverse=True)
+        
+        self.logger.info(f"Found {len(files)} alert files")
         return files
     
     def extract_unusual_symbols(self, alert_files: List[Path]) -> Set[str]:

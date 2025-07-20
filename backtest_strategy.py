@@ -15,19 +15,29 @@ class OptionFlowBacktester:
         self.price_data = {}
         
     def load_alerts(self) -> List[Dict]:
-        """Load alert data from specific JSON files"""
+        """Load alert data from all alert files with alerts_yyyy-mm-dd.json format"""
         alerts = []
-        target_files = ['alerts_2025-07-15.json', 'alerts_2025-07-16.json', 'alerts_2025-07-18.json']
         
-        for filename in target_files:
-            filepath = os.path.join(self.alert_data_dir, filename)
-            if os.path.exists(filepath):
-                with open(filepath, 'r') as f:
-                    daily_alerts = json.load(f)
-                    alerts.extend(daily_alerts)
-                    print(f"Loaded {len(daily_alerts)} alerts from {filename}")
-            else:
-                print(f"Warning: {filename} not found")
+        if os.path.exists(self.alert_data_dir):
+            # Get all files matching the pattern alerts_yyyy-mm-dd.json
+            for filename in os.listdir(self.alert_data_dir):
+                if filename.startswith('alerts_') and filename.endswith('.json'):
+                    # Verify the filename matches the expected date format
+                    try:
+                        date_part = filename.replace('alerts_', '').replace('.json', '')
+                        datetime.strptime(date_part, '%Y-%m-%d')  # Validate date format
+                        
+                        filepath = os.path.join(self.alert_data_dir, filename)
+                        with open(filepath, 'r') as f:
+                            daily_alerts = json.load(f)
+                            alerts.extend(daily_alerts)
+                            print(f"Loaded {len(daily_alerts)} alerts from {filename}")
+                    except ValueError:
+                        continue  # Skip files that don't match the date format
+                    except Exception as e:
+                        print(f"Error loading {filename}: {e}")
+        
+        print(f"Total loaded alerts: {len(alerts)}")
         return alerts
     
     def load_price_data(self) -> Dict[str, pd.DataFrame]:
@@ -44,12 +54,13 @@ class OptionFlowBacktester:
         return price_data
     
     def filter_flow_alerts(self, alerts: List[Dict]) -> List[Dict]:
-        """Filter alerts for exactly 'Flow alerts for All' rule"""
+        """Filter alerts for 'Flow alerts for All' and 'Flow alerts for All put' rules"""
         filtered = []
+        target_names = ['Flow alerts for All', 'Flow alerts for All put']
+        
         for alert in alerts:
             alert_name = alert.get('name', '')
-            # Only match exactly "Flow alerts for All"
-            if alert_name == 'Flow alerts for All':
+            if alert_name in target_names:
                 filtered.append(alert)
         return filtered
     
@@ -102,10 +113,34 @@ class OptionFlowBacktester:
             return 0
     
     def select_top_abnormal_per_day(self, flow_alerts: List[Dict]) -> List[Dict]:
-        """Select top 10 most abnormal alerts per trading day"""
-        daily_alerts = {}
+        """Select top 10 most abnormal alerts per trading day with deduplication"""
+        # First, deduplicate alerts based on symbol, executed_time, and underlying_symbol
+        seen_alerts = set()
+        deduplicated_alerts = []
         
         for alert in flow_alerts:
+            try:
+                executed_time_str = alert['meta']['executed_at']
+                underlying_symbol = alert['meta']['underlying_symbol']
+                option_symbol = alert['symbol']
+                
+                # Create a unique key for deduplication
+                alert_key = (executed_time_str, underlying_symbol, option_symbol)
+                
+                if alert_key not in seen_alerts:
+                    seen_alerts.add(alert_key)
+                    deduplicated_alerts.append(alert)
+                else:
+                    print(f"Skipping duplicate alert: {underlying_symbol} at {executed_time_str}")
+            except Exception as e:
+                print(f"Error processing alert for deduplication: {e}")
+                continue
+        
+        print(f"Deduplicated {len(flow_alerts)} alerts to {len(deduplicated_alerts)} unique alerts")
+        
+        daily_alerts = {}
+        
+        for alert in deduplicated_alerts:
             try:
                 executed_time = self.convert_utc_to_et(alert['meta']['executed_at'])
                 trade_date = executed_time.date()

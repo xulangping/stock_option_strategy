@@ -89,28 +89,36 @@ class AlertMonitor:
             return []
     
     def get_alerts_data(self, config_ids, limit=200):
-        """获取指定配置的alert数据"""
+        """获取指定配置的alert数据 - 每个config_id单独请求"""
         url = f"{self.base_url}/alerts"
+        all_alerts = []
         
-        # 构建查询参数
-        params = {
-            'limit': limit,
-            'config_ids[]': config_ids
-        }
+        for config_id in config_ids:
+            # 构建查询参数 - 每次只请求一个config_id
+            params = {
+                'limit': limit,
+                'config_ids[]': [config_id]
+            }
+            
+            try:
+                response = requests.get(url, headers=self.headers, params=params)
+                if response.status_code == 200:
+                    data = response.json()
+                    alerts = data.get('data', [])
+                    all_alerts.extend(alerts)
+                    self.logger.info(f"配置ID {config_id} 获取到{len(alerts)}个alert数据")
+                else:
+                    self.logger.error(f"获取配置ID {config_id} 的alert数据失败: {response.status_code} - {response.text}")
+                
+                # 添加小延迟避免请求过于频繁
+                time.sleep(0.1)
+                
+            except Exception as e:
+                self.logger.error(f"获取配置ID {config_id} 的alert数据异常: {e}")
+                continue
         
-        try:
-            response = requests.get(url, headers=self.headers, params=params)
-            if response.status_code == 200:
-                data = response.json()
-                alerts = data.get('data', [])
-                self.logger.info(f"获取到{len(alerts)}个alert数据")
-                return alerts
-            else:
-                self.logger.error(f"获取alert数据失败: {response.status_code} - {response.text}")
-                return []
-        except Exception as e:
-            self.logger.error(f"获取alert数据异常: {e}")
-            return []
+        self.logger.info(f"总共获取到{len(all_alerts)}个alert数据")
+        return all_alerts
     
     def save_alerts_to_json(self, alerts, timestamp):
         """保存alert数据到JSON文件"""
