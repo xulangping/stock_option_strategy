@@ -71,22 +71,144 @@ class AlertMonitor:
         except Exception as e:
             self.logger.error(f"保存已处理alert ID失败: {e}")
     
-    def get_alert_configurations(self):
-        """获取所有alert配置"""
-        url = f"{self.base_url}/alerts/configuration"
+    def get_flow_alerts_from_api(self, newer_than_hours=24, limit=200):
+        """从新的flow alerts API获取数据"""
+        url = f"{self.base_url}/option-trades/flow-alerts"
+        
+        # 计算时间范围
+        now = datetime.now()
+        start_time = now - timedelta(hours=newer_than_hours)
+        newer_than = start_time.strftime('%Y-%m-%d')
+        
+        # 获取看涨期权数据
+        call_params = {
+            'all_opening': 'true',
+            'is_ask_side': 'true', 
+            'is_call': 'true',
+            'is_otm': 'true',
+            'max_diff': '1',           # Max % OTM: 1
+            'min_diff': '0.01',        # Min % OTM: 0.01
+            'max_dte': '60',           # Max DTE: 60
+            'min_premium': '100000',   # Min Premium: 100000
+            'min_volume_oi_ratio': '1', # Volume > OI (volume/oi > 1)
+            'issue_types[]': ['Common Stock', 'ETF', 'Index', 'ADR'],
+            'newer_than': newer_than,
+            'limit': str(limit)
+        }
+        
+        # 获取看跌期权数据
+        put_params = {
+            'all_opening': 'true',
+            'is_ask_side': 'true', 
+            'is_put': 'true',
+            'is_otm': 'true',
+            'max_diff': '1',           # Max % OTM: 1
+            'min_diff': '0.01',        # Min % OTM: 0.01
+            'max_dte': '60',           # Max DTE: 60
+            'min_premium': '100000',   # Min Premium: 100000
+            'min_volume_oi_ratio': '1', # Volume > OI (volume/oi > 1)
+            'issue_types[]': ['Common Stock', 'ETF', 'Index', 'ADR'],
+            'newer_than': newer_than,
+            'limit': str(limit)
+        }
+        
+        all_alerts = []
         
         try:
-            response = requests.get(url, headers=self.headers)
-            if response.status_code == 200:
-                data = response.json()
-                self.logger.info(f"获取到{len(data.get('data', []))}个alert配置")
-                return data.get('data', [])
+            self.logger.info(f"从flow alerts API获取数据，时间范围: {newer_than} 至今")
+            
+            # 获取看涨期权数据
+            self.logger.info("获取看涨期权数据...")
+            call_response = requests.get(url, headers=self.headers, params=call_params)
+            if call_response.status_code == 200:
+                call_data = call_response.json()
+                call_alerts = call_data.get('data', [])
+                all_alerts.extend(call_alerts)
+                self.logger.info(f"获取到{len(call_alerts)}个看涨期权alerts")
             else:
-                self.logger.error(f"获取alert配置失败: {response.status_code} - {response.text}")
-                return []
+                self.logger.error(f"获取看涨期权alerts失败: {call_response.status_code}")
+            
+            # 获取看跌期权数据
+            self.logger.info("获取看跌期权数据...")
+            put_response = requests.get(url, headers=self.headers, params=put_params)
+            if put_response.status_code == 200:
+                put_data = put_response.json()
+                put_alerts = put_data.get('data', [])
+                all_alerts.extend(put_alerts)
+                self.logger.info(f"获取到{len(put_alerts)}个看跌期权alerts")
+            else:
+                self.logger.error(f"获取看跌期权alerts失败: {put_response.status_code}")
+            
+            self.logger.info(f"总共获取到{len(all_alerts)}个flow alerts")
+            return all_alerts
+                
         except Exception as e:
-            self.logger.error(f"获取alert配置异常: {e}")
+            self.logger.error(f"获取flow alerts异常: {e}")
             return []
+    
+    def convert_api_data_to_original_format(self, api_alerts):
+        """将新API数据转换为原始格式"""
+        converted_alerts = []
+        
+        for alert in api_alerts:
+            try:
+                # 使用created_at作为执行时间（这是正确的UTC时间）
+                created_at = alert.get('created_at', '')
+                if created_at:
+                    executed_at = created_at
+                else:
+                    executed_at = datetime.now().isoformat() + 'Z'
+                
+                # 根据期权类型设置名称
+                option_type = alert.get('type', 'call')
+                if option_type == 'put':
+                    alert_name = 'Flow alerts for All put'
+                else:
+                    alert_name = 'Flow alerts for All'
+                
+                # 构建原始格式的alert
+                converted_alert = {
+                    'id': alert.get('id', ''),
+                    'created_at': alert.get('created_at', executed_at),
+                    'name': alert_name,  # 根据期权类型设置名称
+                    'noti_type': 'flow_alerts',     # 固定类型
+                    'symbol': alert.get('option_chain', ''),
+                    'symbol_type': 'option',
+                    'tape_time': executed_at,
+                    'user_noti_config_id': 'api_generated',
+                    'meta': {
+                        'executed_at': executed_at,
+                        'underlying_symbol': alert.get('ticker', ''),
+                        'total_premium': str(alert.get('total_premium', '0')),
+                        'volume': alert.get('volume', 0),
+                        'open_interest': alert.get('open_interest', 0),
+                        'vol_oi_ratio': str(alert.get('volume_oi_ratio', '0')),
+                        'strike_price': str(alert.get('strike', '0')),
+                        'expiry': alert.get('expiry', ''),
+                        'option_type': alert.get('type', 'call'),
+                        'underlying_price': str(alert.get('underlying_price', '0')),
+                        'iv': str(alert.get('iv_end', '0')),
+                        'sector': alert.get('sector', ''),
+                        'market_cap': str(alert.get('marketcap', '0')),
+                        'alert_rule': alert.get('alert_rule', ''),
+                        'total_size': alert.get('total_size', 0),
+                        'trade_count': alert.get('trade_count', 0),
+                        'has_floor': alert.get('has_floor', False),
+                        'has_sweep': alert.get('has_sweep', False),
+                        'price': str(alert.get('price', '0')),
+                        'bid': str(alert.get('bid', '0')),
+                        'ask': str(alert.get('ask', '0'))
+                    }
+                }
+                
+                converted_alerts.append(converted_alert)
+                
+            except Exception as e:
+                self.logger.error(f"转换alert数据失败: {e}, alert: {alert.get('id', 'unknown')}")
+                continue
+        
+        self.logger.info(f"成功转换{len(converted_alerts)}个alert到原始格式")
+        return converted_alerts
     
     def get_alerts_data(self, config_ids, limit=200):
         """获取指定配置的alert数据 - 每个config_id单独请求"""
@@ -249,42 +371,30 @@ class AlertMonitor:
     
     def run_once(self):
         """执行一次检查"""
-        self.logger.info("开始执行alert检查...")
+        self.logger.info("开始执行flow alerts检查...")
         timestamp = datetime.now()
         
-        # 1. 获取alert配置
-        configs = self.get_alert_configurations()
-        if not configs:
-            self.logger.warning("未获取到alert配置")
+        # 1. 从新的flow alerts API获取数据
+        api_alerts = self.get_flow_alerts_from_api(newer_than_hours=24, limit=200)
+        if not api_alerts:
+            self.logger.info("未获取到flow alerts数据")
             return
         
-        # 2. 提取活跃配置的ID
-        active_config_ids = [
-            config['id'] for config in configs 
-            if config.get('status') == 'active'
-        ]
-        
-        if not active_config_ids:
-            self.logger.warning("未找到活跃的alert配置")
-            return
-        
-        self.logger.info(f"找到{len(active_config_ids)}个活跃的alert配置")
-        
-        # 3. 获取alert数据
-        alerts = self.get_alerts_data(active_config_ids)
+        # 2. 转换数据格式为原始格式
+        alerts = self.convert_api_data_to_original_format(api_alerts)
         if not alerts:
-            self.logger.info("未获取到alert数据")
+            self.logger.warning("数据转换后为空")
             return
         
-        # 4. 保存数据
+        # 3. 保存数据（使用原来的保存逻辑）
         self.save_alerts_to_json(alerts, timestamp)
         self.save_alerts_to_csv(alerts, timestamp)
         self.save_summary_report(alerts, timestamp)
         
-        # 5. 保存已处理的alert ID
+        # 4. 保存已处理的alert ID
         self.save_processed_alerts()
         
-        self.logger.info(f"alert检查完成，处理了{len(alerts)}个alert")
+        self.logger.info(f"flow alerts检查完成，处理了{len(alerts)}个alert")
     
     def run_continuous(self, interval_hours=1):
         """持续运行，每隔指定小时检查一次"""

@@ -208,51 +208,130 @@ class OptionFlowBacktester:
             
         return future_prices.iloc[0]['Close']
     
-    def monitor_trade_with_stops(self, symbol: str, entry_price: float, entry_time: datetime, 
-                                trade_date: datetime) -> Dict:
-        """Monitor trade with stop-loss and take-profit"""
+    def get_next_trading_day_open(self, symbol: str, after_time: datetime) -> tuple:
+        """Get the opening price of the next trading day after given time"""
+        if symbol not in self.price_data:
+            return None, None
+            
+        df = self.price_data[symbol]
+        
+        # Find the next trading day (after 9:30 AM ET)
+        next_day = after_time.date() + timedelta(days=1)
+        
+        # Look for prices on the next day starting from 9:30 AM
+        et_tz = pytz.timezone('US/Eastern')
+        next_day_start = et_tz.localize(datetime.combine(next_day, datetime.min.time().replace(hour=9, minute=30)))
+        
+        # Find the first price after market open on next day
+        next_day_prices = df[df.index >= next_day_start]
+        if next_day_prices.empty:
+            return None, None
+            
+        open_price = next_day_prices.iloc[0]['Open']  # Use Open price instead of Close
+        open_time = next_day_prices.index[0]
+        
+        return open_price, open_time
+    
+    def is_after_hours(self, trade_time: datetime) -> bool:
+        """Check if the trade time is after market hours (after 4:00 PM ET)"""
+        # Market closes at 4:00 PM ET
+        market_close_time = trade_time.replace(hour=16, minute=0, second=0, microsecond=0)
+        return trade_time.time() > market_close_time.time()
+    
+    def determine_trade_direction(self, alert: Dict) -> str:
+        """
+        Determine if the option trade is long or short based on price vs bid/ask and option type
+        For Call options: price closer to ask = buy call (long), price closer to bid = sell call (short)
+        For Put options: price closer to ask = buy put (short), price closer to bid = sell put (long)
+        Returns: 'long' or 'short'
+        """
+        try:
+            price = float(alert['meta'].get('price', 0))
+            bid = float(alert['meta'].get('bid', 0))
+            ask = float(alert['meta'].get('ask', 0))
+            option_symbol = alert.get('symbol', '')
+            
+            if price == 0 or (bid == 0 and ask == 0):
+                # Default to long if we can't determine
+                return 'long'
+            
+            # Determine if it's a call or put option
+            is_put = 'P' in option_symbol  # Put options have 'P' in symbol, calls have 'C'
+            
+            # Calculate mid-point and determine if closer to bid or ask
+            if bid > 0 and ask > 0:
+                closer_to_ask = abs(price - ask) < abs(price - bid)
+                
+                if is_put:
+                    # For PUT options:
+                    # Price closer to ask = buy put (short underlying)
+                    # Price closer to bid = sell put (long underlying)
+                    return 'short' if closer_to_ask else 'long'
+                else:
+                    # For CALL options:
+                    # Price closer to ask = buy call (long underlying)
+                    # Price closer to bid = sell call (short underlying)
+                    return 'long' if closer_to_ask else 'short'
+            
+            # Fallback: if price < bid, it's likely a sell
+            if bid > 0 and price < bid:
+                return 'short' if not is_put else 'long'
+            
+            # Default to long
+            return 'long'
+            
+        except (ValueError, TypeError):
+            return 'long'
+    
+    def monitor_trade_new_exit_rule(self, symbol: str, entry_price: float, entry_time: datetime, 
+                                   trade_date: datetime, trade_direction: str = 'long') -> Dict:
+        """Monitor trade with new exit rule: sell next day open if available, otherwise current day close"""
         if symbol not in self.price_data:
             return None
             
         df = self.price_data[symbol]
         
-        # Get all prices from entry time to end of day
-        same_day_prices = df[(df.index >= entry_time) & (df.index.date == trade_date.date())]
+        # First, try to get next day open price
+        next_day = trade_date.date() + timedelta(days=1)
+        et_tz = pytz.timezone('US/Eastern')
         
-        if same_day_prices.empty:
-            return None
+        # Look for next trading day prices (starting from 9:30 AM ET)
+        next_day_start = et_tz.localize(datetime.combine(next_day, datetime.min.time().replace(hour=9, minute=30)))
+        next_day_prices = df[df.index >= next_day_start]
         
-        stop_loss_price = entry_price * 0.98  # -2% stop loss
-        take_profit_price = entry_price * 1.05  # +5% take profit
-        
-        for timestamp, row in same_day_prices.iterrows():
-            current_price = row['Close']
+        # Check if we have next day data
+        if not next_day_prices.empty:
+            # We have next day data, exit at next day open
+            exit_price = next_day_prices.iloc[0]['Open']
+            exit_time = next_day_prices.index[0]
+            exit_reason = 'next_day_open'
             
-            # Check stop loss
-            if current_price <= stop_loss_price:
-                return {
-                    'exit_price': current_price,
-                    'exit_time': timestamp,
-                    'exit_reason': 'stop_loss'
-                }
+            print(f"  -> Exiting at next day open: {exit_price:.2f} at {exit_time}")
             
-            # Check take profit
-            if current_price >= take_profit_price:
-                return {
-                    'exit_price': current_price,
-                    'exit_time': timestamp,
-                    'exit_reason': 'take_profit'
-                }
-        
-        # If no stop triggered, exit at end of day
-        final_price = same_day_prices.iloc[-1]['Close']
-        final_time = same_day_prices.index[-1]
-        
-        return {
-            'exit_price': final_price,
-            'exit_time': final_time,
-            'exit_reason': 'end_of_day'
-        }
+            return {
+                'exit_price': exit_price,
+                'exit_time': exit_time,
+                'exit_reason': exit_reason
+            }
+        else:
+            # No next day data, exit at current day close
+            same_day_prices = df[(df.index >= entry_time) & (df.index.date == trade_date.date())]
+            
+            if same_day_prices.empty:
+                return None
+            
+            # Exit at end of current day
+            final_price = same_day_prices.iloc[-1]['Close']
+            final_time = same_day_prices.index[-1]
+            exit_reason = 'current_day_close'
+            
+            print(f"  -> No next day data, exiting at current day close: {final_price:.2f} at {final_time}")
+            
+            return {
+                'exit_price': final_price,
+                'exit_time': final_time,
+                'exit_reason': exit_reason
+            }
     
     def run_backtest(self) -> Dict:
         """Run the backtesting strategy"""
@@ -287,14 +366,34 @@ class OptionFlowBacktester:
                 
                 print(f"Processing alert for {underlying_symbol} at {executed_time}")
                 
-                # Get buy price
-                buy_price = self.get_price_at_time(underlying_symbol, buy_time)
-                if buy_price is None:
-                    print(f"Skipping {underlying_symbol} - no buy price available")
-                    continue
+                # Determine trade direction (long or short)
+                trade_direction = self.determine_trade_direction(alert)
+                option_price = float(alert['meta'].get('price', 0))
+                bid = float(alert['meta'].get('bid', 0))
+                ask = float(alert['meta'].get('ask', 0))
+                option_symbol = alert.get('symbol', '')
+                option_type = 'PUT' if 'P' in option_symbol else 'CALL'
+                print(f"Option details: {option_type} price=${option_price:.2f}, bid=${bid:.2f}, ask=${ask:.2f} -> {trade_direction.upper()}")
                 
-                # Monitor trade with stop-loss and take-profit
-                exit_info = self.monitor_trade_with_stops(underlying_symbol, buy_price, buy_time, buy_time)
+                # Check if this is an after-hours signal
+                if self.is_after_hours(executed_time):
+                    print(f"After-hours signal detected for {underlying_symbol}, using next day open price")
+                    # Use next trading day open price
+                    buy_price, actual_buy_time = self.get_next_trading_day_open(underlying_symbol, executed_time)
+                    if buy_price is None:
+                        print(f"Skipping {underlying_symbol} - no next day open price available")
+                        continue
+                    buy_time = actual_buy_time
+                    trade_date = buy_time.date()
+                else:
+                    # Normal intraday signal
+                    buy_price = self.get_price_at_time(underlying_symbol, buy_time)
+                    if buy_price is None:
+                        print(f"Skipping {underlying_symbol} - no buy price available")
+                        continue
+                
+                # Monitor trade with new exit rule
+                exit_info = self.monitor_trade_new_exit_rule(underlying_symbol, buy_price, buy_time, buy_time, trade_direction)
                 if exit_info is None:
                     print(f"Skipping {underlying_symbol} - no exit price available")
                     continue
@@ -302,8 +401,12 @@ class OptionFlowBacktester:
                 sell_price = exit_info['exit_price']
                 exit_reason = exit_info['exit_reason']
                 
-                # Calculate return
-                return_pct = (sell_price - buy_price) / buy_price
+                # Calculate return based on trade direction
+                if trade_direction == 'long':
+                    return_pct = (sell_price - buy_price) / buy_price
+                else:
+                    # For short trades, profit when price goes down
+                    return_pct = (buy_price - sell_price) / buy_price
                 
                 # Track trades by date for position sizing
                 if trade_date not in daily_trades:
@@ -320,11 +423,17 @@ class OptionFlowBacktester:
                     'return_pct': return_pct,
                     'exit_reason': exit_reason,
                     'alert_id': alert['id'],
-                    'abnormality_score': alert_info['score']
+                    'abnormality_score': alert_info['score'],
+                    'trade_direction': trade_direction,
+                    'option_type': option_type,
+                    'option_symbol': option_symbol,
+                    'option_price': option_price,
+                    'option_bid': bid,
+                    'option_ask': ask
                 }
                 
                 daily_trades[trade_date].append(trade_info)
-                print(f"Added trade: {underlying_symbol} {return_pct:.2%} (exit: {exit_reason})")
+                print(f"Added trade: {underlying_symbol} {return_pct:.2%} ({trade_direction.upper()}, exit: {exit_reason})")
                 
             except Exception as e:
                 print(f"Error processing alert {alert.get('id', 'unknown')}: {e}")
@@ -333,8 +442,8 @@ class OptionFlowBacktester:
         # Calculate position sizes: 10% each, max 100% total
         for date, day_trades in daily_trades.items():
             num_trades = len(day_trades)
-            if num_trades <= 10:
-                position_size = 0.10  # 10% each
+            if num_trades <= 4:
+                position_size = 0.25  # 10% each
             else:
                 position_size = 1.0 / num_trades  # Split 100% evenly
             
@@ -401,13 +510,15 @@ class OptionFlowBacktester:
         
         # Show all trades
         print("\nAll Trades:")
-        print("-" * 100)
-        print(f"{'Date':<12} {'Symbol':<6} {'Buy Price':<10} {'Sell Price':<10} {'Return':<8} {'Exit Reason':<12} {'Score':<8}")
-        print("-" * 100)
+        print("-" * 125)
+        print(f"{'Date':<12} {'Symbol':<6} {'Type':<5} {'Dir':<5} {'Buy Price':<10} {'Sell Price':<10} {'Return':<8} {'Exit Reason':<15} {'Score':<8}")
+        print("-" * 125)
         
         for trade in results['trades']:
-            print(f"{trade['date']!s:<12} {trade['symbol']:<6} {trade['buy_price']:<10.2f} "
-                  f"{trade['sell_price']:<10.2f} {trade['return_pct']:<8.2%} {trade['exit_reason']:<12} {trade['abnormality_score']:<8.0f}")
+            direction = trade.get('trade_direction', 'long').upper()[:4]
+            option_type = trade.get('option_type', 'CALL')[:4]  # Show first 4 chars (CALL/PUT)
+            print(f"{trade['date']!s:<12} {trade['symbol']:<6} {option_type:<5} {direction:<5} {trade['buy_price']:<10.2f} "
+                  f"{trade['sell_price']:<10.2f} {trade['return_pct']:<8.2%} {trade['exit_reason']:<15} {trade['abnormality_score']:<8.0f}")
 
 def main():
     # Initialize backtester
@@ -420,7 +531,7 @@ def main():
     backtester.print_results(results)
     
     # Save detailed results to JSON
-    with open('backtest_results_v2.json', 'w') as f:
+    with open('backtest_results_v3.json', 'w') as f:
         # Convert datetime objects to strings for JSON serialization
         json_results = results.copy()
         for trade in json_results['trades']:
@@ -431,7 +542,7 @@ def main():
         
         json.dump(json_results, f, indent=2, default=str)
     
-    print(f"\nDetailed results saved to 'backtest_results_v2.json'")
+    print(f"\nDetailed results saved to 'backtest_results_v3.json'")
 
 if __name__ == "__main__":
     main() 
