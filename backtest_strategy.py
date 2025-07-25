@@ -203,10 +203,10 @@ class OptionFlowBacktester:
             same_day_prices = df[df.index.date == target_time.date()]
             if same_day_prices.empty:
                 return None
-            # Use the last available price of the day
-            return same_day_prices.iloc[-1]['Close']
+            # Use the last available Open price of the day
+            return same_day_prices.iloc[-1]['Open']
             
-        return future_prices.iloc[0]['Close']
+        return future_prices.iloc[0]['Open']
     
     def get_next_trading_day_open(self, symbol: str, after_time: datetime) -> tuple:
         """Get the opening price of the next trading day after given time"""
@@ -320,8 +320,8 @@ class OptionFlowBacktester:
             if same_day_prices.empty:
                 return None
             
-            # Exit at end of current day
-            final_price = same_day_prices.iloc[-1]['Close']
+            # Exit at end of current day using Open price
+            final_price = same_day_prices.iloc[-1]['Open']
             final_time = same_day_prices.index[-1]
             exit_reason = 'current_day_close'
             
@@ -439,13 +439,19 @@ class OptionFlowBacktester:
                 print(f"Error processing alert {alert.get('id', 'unknown')}: {e}")
                 continue
         
-        # Calculate position sizes: 10% each, max 100% total
+        # Calculate position sizes: 20% each, max 5 trades per day
+        
         for date, day_trades in daily_trades.items():
             num_trades = len(day_trades)
-            if num_trades <= 4:
-                position_size = 0.25  # 10% each
-            else:
-                position_size = 1.0 / num_trades  # Split 100% evenly
+            
+            # If more than 5 trades, select only top 5 by abnormality score
+            if num_trades > 5:
+                day_trades.sort(key=lambda x: x['abnormality_score'], reverse=True)
+                day_trades = day_trades[:5]
+                print(f"Date {date}: Limited from {num_trades} to 5 trades (selected top 5 by score)")
+                num_trades = 5
+            
+            position_size = 0.2  # Always 20% each (up to 5 trades per day)
             
             print(f"Date {date}: {num_trades} trades, {position_size:.1%} each")
             
@@ -510,14 +516,15 @@ class OptionFlowBacktester:
         
         # Show all trades
         print("\nAll Trades:")
-        print("-" * 125)
-        print(f"{'Date':<12} {'Symbol':<6} {'Type':<5} {'Dir':<5} {'Buy Price':<10} {'Sell Price':<10} {'Return':<8} {'Exit Reason':<15} {'Score':<8}")
-        print("-" * 125)
+        print("-" * 150)
+        print(f"{'Date':<12} {'Symbol':<6} {'Type':<5} {'Dir':<5} {'Buy Time':<17} {'Buy Price':<10} {'Sell Price':<10} {'Return':<8} {'Exit Reason':<15} {'Score':<8}")
+        print("-" * 150)
         
         for trade in results['trades']:
             direction = trade.get('trade_direction', 'long').upper()[:4]
             option_type = trade.get('option_type', 'CALL')[:4]  # Show first 4 chars (CALL/PUT)
-            print(f"{trade['date']!s:<12} {trade['symbol']:<6} {option_type:<5} {direction:<5} {trade['buy_price']:<10.2f} "
+            buy_time_str = trade['buy_time'].strftime('%m-%d %H:%M')  # Format as MM-DD HH:MM
+            print(f"{trade['date']!s:<12} {trade['symbol']:<6} {option_type:<5} {direction:<5} {buy_time_str:<17} {trade['buy_price']:<10.2f} "
                   f"{trade['sell_price']:<10.2f} {trade['return_pct']:<8.2%} {trade['exit_reason']:<15} {trade['abnormality_score']:<8.0f}")
 
 def main():
