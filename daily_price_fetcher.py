@@ -294,7 +294,7 @@ class DailyPriceFetcher:
         
         self.logger.info(f"Daily price fetching completed. Processed {processed_count} symbols.")
     
-    def run_update_mode(self, price_days: int = 1):
+    def run_update_mode(self, price_days: int = 2):
         """Run in update mode - update existing symbols with recent data"""
         self.logger.info("Running in update mode...")
         
@@ -315,6 +315,124 @@ class DailyPriceFetcher:
             time.sleep(5)
         
         self.logger.info("Update mode completed.")
+    
+    def check_missing_data(self, symbols: List[str], start_date: str, end_date: str):
+        """Check which symbols are missing data for specific date range"""
+        self.logger.info(f"Checking missing data for {len(symbols)} symbols from {start_date} to {end_date}")
+        
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+        
+        missing_data_report = []
+        
+        for symbol in symbols:
+            csv_file = self.price_data_dir / f"{symbol}_5min.csv"
+            
+            if not csv_file.exists():
+                missing_data_report.append({
+                    'symbol': symbol,
+                    'issue': 'file_not_exists',
+                    'missing_dates': f"{start_date} to {end_date}"
+                })
+                continue
+            
+            try:
+                # Load existing data
+                df = pd.read_csv(csv_file)
+                df['Datetime'] = pd.to_datetime(df['Datetime'])
+                df['Date'] = df['Datetime'].dt.date
+                
+                # Check each date in the range
+                missing_dates = []
+                current_date = start_dt
+                
+                while current_date <= end_dt:
+                    # Skip weekends (assuming trading days only)
+                    if current_date.weekday() < 5:  # Monday=0, Sunday=6
+                        date_data = df[df['Date'] == current_date.date()]
+                        if date_data.empty:
+                            missing_dates.append(current_date.strftime('%Y-%m-%d'))
+                    
+                    current_date += timedelta(days=1)
+                
+                if missing_dates:
+                    missing_data_report.append({
+                        'symbol': symbol,
+                        'issue': 'missing_dates',
+                        'missing_dates': missing_dates
+                    })
+                    
+            except Exception as e:
+                missing_data_report.append({
+                    'symbol': symbol,
+                    'issue': f'error_reading_file: {e}',
+                    'missing_dates': f"{start_date} to {end_date}"
+                })
+        
+        return missing_data_report
+    
+    def fetch_missing_data(self, symbols: List[str], start_date: str, end_date: str):
+        """Fetch missing data for specific symbols and date range"""
+        self.logger.info(f"Fetching missing data for symbols: {symbols}")
+        self.logger.info(f"Date range: {start_date} to {end_date}")
+        
+        # First check what's missing
+        missing_report = self.check_missing_data(symbols, start_date, end_date)
+        
+        if not missing_report:
+            self.logger.info("No missing data found!")
+            return
+        
+        # Report missing data
+        print("\n" + "="*60)
+        print("MISSING DATA REPORT")
+        print("="*60)
+        for item in missing_report:
+            print(f"Symbol: {item['symbol']}")
+            print(f"Issue: {item['issue']}")
+            print(f"Missing: {item['missing_dates']}")
+            print("-" * 40)
+        
+        # Calculate extended date range for fetching
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+        
+        # Add buffer days
+        extended_start = start_dt - timedelta(days=5)
+        extended_end = end_dt + timedelta(days=5)
+        days_to_fetch = (extended_end - extended_start).days
+        
+        # Fetch data for symbols with missing data
+        for item in missing_report:
+            symbol = item['symbol']
+            self.logger.info(f"Fetching extended data for {symbol}...")
+            
+            # Fetch data with extended range
+            price_data = self.fetch_price_data(symbol, days_to_fetch)
+            
+            if not price_data.empty:
+                self.save_price_data(symbol, price_data)
+                self.logger.info(f"✅ Updated data for {symbol}")
+            else:
+                self.logger.error(f"❌ Failed to fetch data for {symbol}")
+            
+            # Longer delay to avoid rate limiting
+            time.sleep(8)
+        
+        # Verify the fixes
+        print("\n" + "="*60)
+        print("VERIFICATION AFTER FETCH")
+        print("="*60)
+        
+        verification_report = self.check_missing_data(symbols, start_date, end_date)
+        if verification_report:
+            print("❌ Still missing data:")
+            for item in verification_report:
+                print(f"  {item['symbol']}: {item['missing_dates']}")
+        else:
+            print("✅ All missing data has been filled!")
+        
+        self.logger.info("Missing data fetch completed.")
 
 def main():
     """Main function"""
@@ -326,11 +444,76 @@ def main():
         if sys.argv[1] == "--update":
             # Update mode - update existing symbols with recent data
             fetcher.run_update_mode()
+        elif sys.argv[1] == "--fix-missing":
+            # Fix missing data mode
+            if len(sys.argv) != 5:
+                print("Usage: python daily_price_fetcher.py --fix-missing SYMBOLS START_DATE END_DATE")
+                print("Example: python daily_price_fetcher.py --fix-missing UNH,AAPL,TSLA 2025-07-22 2025-07-25")
+                return
+            
+            symbols_str = sys.argv[2]
+            start_date = sys.argv[3]
+            end_date = sys.argv[4]
+            
+            # Parse symbols
+            symbols = [s.strip() for s in symbols_str.split(',')]
+            
+            # Validate date format
+            try:
+                datetime.strptime(start_date, '%Y-%m-%d')
+                datetime.strptime(end_date, '%Y-%m-%d')
+            except ValueError:
+                print("Error: Dates must be in YYYY-MM-DD format")
+                return
+            
+            fetcher.fetch_missing_data(symbols, start_date, end_date)
+            
+        elif sys.argv[1] == "--check-missing":
+            # Check missing data mode
+            if len(sys.argv) != 5:
+                print("Usage: python daily_price_fetcher.py --check-missing SYMBOLS START_DATE END_DATE")
+                print("Example: python daily_price_fetcher.py --check-missing UNH,AAPL,TSLA 2025-07-22 2025-07-25")
+                return
+            
+            symbols_str = sys.argv[2]
+            start_date = sys.argv[3]
+            end_date = sys.argv[4]
+            
+            # Parse symbols
+            symbols = [s.strip() for s in symbols_str.split(',')]
+            
+            # Validate date format
+            try:
+                datetime.strptime(start_date, '%Y-%m-%d')
+                datetime.strptime(end_date, '%Y-%m-%d')
+            except ValueError:
+                print("Error: Dates must be in YYYY-MM-DD format")
+                return
+            
+            missing_report = fetcher.check_missing_data(symbols, start_date, end_date)
+            
+            if missing_report:
+                print("\n" + "="*60)
+                print("MISSING DATA REPORT")
+                print("="*60)
+                for item in missing_report:
+                    print(f"Symbol: {item['symbol']}")
+                    print(f"Issue: {item['issue']}")
+                    print(f"Missing: {item['missing_dates']}")
+                    print("-" * 40)
+            else:
+                print("✅ No missing data found!")
+            
         elif sys.argv[1] == "--help":
             print("Usage:")
-            print("  python daily_price_fetcher.py           # Run daily fetch")
-            print("  python daily_price_fetcher.py --update  # Update existing symbols")
-            print("  python daily_price_fetcher.py --help    # Show this help")
+            print("  python daily_price_fetcher.py                                    # Run daily fetch")
+            print("  python daily_price_fetcher.py --update                          # Update existing symbols")
+            print("  python daily_price_fetcher.py --check-missing SYMBOLS START END # Check missing data")
+            print("  python daily_price_fetcher.py --fix-missing SYMBOLS START END   # Fix missing data")
+            print("  python daily_price_fetcher.py --help                            # Show this help")
+            print("\nExamples:")
+            print("  python daily_price_fetcher.py --check-missing UNH,AAPL 2025-07-22 2025-07-25")
+            print("  python daily_price_fetcher.py --fix-missing UNH,AAPL 2025-07-22 2025-07-25")
             return
     else:
         # Default: run daily fetch

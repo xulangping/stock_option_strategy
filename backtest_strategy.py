@@ -8,15 +8,20 @@ import pytz
 import re
 
 class OptionFlowBacktester:
-    def __init__(self, alert_data_dir: str, price_data_dir: str):
+    def __init__(self, alert_data_dir: str, price_data_dir: str, max_trades_per_day: int = 4, min_premium: float = 500000, 
+                 exit_strategy: str = 'next_day_open'):
         self.alert_data_dir = alert_data_dir
         self.price_data_dir = price_data_dir
+        self.max_trades_per_day = max_trades_per_day
+        self.min_premium = min_premium  # Minimum premium (500000 = $500,000)
+        self.exit_strategy = exit_strategy  # 'next_day_open' or 'same_day_close'
         self.alerts = []
         self.price_data = {}
         
     def load_alerts(self) -> List[Dict]:
-        """Load alert data from all alert files with alerts_yyyy-mm-dd.json format"""
+        """Load alert data from 2025-07-16 onwards, but only process those with bid/ask keys for direction determination"""
         alerts = []
+        cutoff_date = datetime(2025, 7, 15)  # Load data from this date onwards
         
         if os.path.exists(self.alert_data_dir):
             # Get all files matching the pattern alerts_yyyy-mm-dd.json
@@ -25,19 +30,32 @@ class OptionFlowBacktester:
                     # Verify the filename matches the expected date format
                     try:
                         date_part = filename.replace('alerts_', '').replace('.json', '')
-                        datetime.strptime(date_part, '%Y-%m-%d')  # Validate date format
+                        file_date = datetime.strptime(date_part, '%Y-%m-%d')  # Validate date format
                         
-                        filepath = os.path.join(self.alert_data_dir, filename)
-                        with open(filepath, 'r') as f:
-                            daily_alerts = json.load(f)
-                            alerts.extend(daily_alerts)
-                            print(f"Loaded {len(daily_alerts)} alerts from {filename}")
+                        # Only load files from cutoff date onwards
+                        if file_date >= cutoff_date:
+                            filepath = os.path.join(self.alert_data_dir, filename)
+                            with open(filepath, 'r') as f:
+                                daily_alerts = json.load(f)
+                                
+                                # Filter alerts that have bid and ask keys for direction determination
+                                valid_alerts = []
+                                for alert in daily_alerts:
+                                    meta = alert.get('meta', {})
+                                    if ('bid' in meta and 'ask' in meta and 
+                                        meta.get('bid') != '0' and meta.get('ask') != '0'):
+                                        valid_alerts.append(alert)
+                                
+                                alerts.extend(valid_alerts)
+                                print(f"Loaded {len(daily_alerts)} alerts from {filename}, {len(valid_alerts)} have bid/ask data")
+                        else:
+                            print(f"Skipped {filename} (before {cutoff_date.strftime('%Y-%m-%d')})")
                     except ValueError:
                         continue  # Skip files that don't match the date format
                     except Exception as e:
                         print(f"Error loading {filename}: {e}")
         
-        print(f"Total loaded alerts: {len(alerts)}")
+        print(f"Total loaded alerts from {cutoff_date.strftime('%Y-%m-%d')} onwards with bid/ask data: {len(alerts)}")
         return alerts
     
     def load_price_data(self) -> Dict[str, pd.DataFrame]:
@@ -81,39 +99,10 @@ class OptionFlowBacktester:
             print(f"Error parsing option symbol {symbol}: {e}")
         return {'expiration': None}
     
-    def calculate_abnormality_score(self, alert: Dict, current_time: datetime) -> float:
-        """Calculate abnormality score based on premium and days to expiration"""
-        try:
-            # Get trading premium
-            premium = float(alert['meta'].get('total_premium', 0))
-            
-            # Parse option symbol to get expiration
-            option_info = self.parse_option_symbol(alert['symbol'])
-            exp_date = option_info['expiration']
-            
-            if exp_date is None:
-                print(f"Failed to parse expiration for {alert['symbol']}")
-                return 0
-            
-            # Calculate days to expiration (make exp_date timezone-aware)
-            et_tz = pytz.timezone('US/Eastern')
-            exp_date_aware = et_tz.localize(exp_date)
-            days_to_exp = (exp_date_aware - current_time).days
-            if days_to_exp <= 0:
-                print(f"Expired option: {alert['symbol']}, days_to_exp: {days_to_exp}")
-                return 0
-            
-            # Abnormality score: higher premium and shorter expiration = higher score
-            # Use premium / days_to_exp as base score
-            score = premium / max(days_to_exp, 1)
-            
-            return score
-        except Exception as e:
-            print(f"Error calculating score for {alert.get('symbol', 'unknown')}: {e}")
-            return 0
+
     
-    def select_top_abnormal_per_day(self, flow_alerts: List[Dict]) -> List[Dict]:
-        """Select top 10 most abnormal alerts per trading day with deduplication"""
+    def select_first_n_per_day(self, flow_alerts: List[Dict]) -> List[Dict]:
+        """Select first N alerts per trading day by time order to avoid lookahead bias"""
         # First, deduplicate alerts based on symbol, executed_time, and underlying_symbol
         seen_alerts = set()
         deduplicated_alerts = []
@@ -124,7 +113,7 @@ class OptionFlowBacktester:
                 underlying_symbol = alert['meta']['underlying_symbol']
                 option_symbol = alert['symbol']
                 
-                # Create a unique key for deduplication
+                # Create a unique key for deduplication (ignore name, only use symbol)
                 alert_key = (executed_time_str, underlying_symbol, option_symbol)
                 
                 if alert_key not in seen_alerts:
@@ -138,6 +127,7 @@ class OptionFlowBacktester:
         
         print(f"Deduplicated {len(flow_alerts)} alerts to {len(deduplicated_alerts)} unique alerts")
         
+        # Group alerts by trading day
         daily_alerts = {}
         
         for alert in deduplicated_alerts:
@@ -145,37 +135,50 @@ class OptionFlowBacktester:
                 executed_time = self.convert_utc_to_et(alert['meta']['executed_at'])
                 trade_date = executed_time.date()
                 
-                # Calculate abnormality score
-                score = self.calculate_abnormality_score(alert, executed_time)
-                
                 if trade_date not in daily_alerts:
                     daily_alerts[trade_date] = []
                 
                 daily_alerts[trade_date].append({
                     'alert': alert,
-                    'score': score,
                     'executed_time': executed_time
                 })
             except Exception as e:
                 print(f"Error processing alert {alert.get('id', 'unknown')}: {e}")
                 continue
         
-        # Select top 10 alerts for each day
+        # Select first 4 alerts for each day by time order (not by score)
         selected_alerts = []
         for date, alerts_list in daily_alerts.items():
             if alerts_list:
-                # Sort by score (descending) and select top 10
-                valid_alerts = [alert for alert in alerts_list if alert['score'] > 0]
-                valid_alerts.sort(key=lambda x: x['score'], reverse=True)
+                                # Filter by premium and data availability, then sort by execution time (ascending - earliest first)
+                valid_alerts = []
+                for alert in alerts_list:
+                    underlying_symbol = alert['alert']['meta']['underlying_symbol']
+                    premium = float(alert['alert']['meta'].get('total_premium', 0))
+                    
+                    # Check if premium meets minimum requirement
+                    if premium < self.min_premium:
+                        print(f"    Filtered out {underlying_symbol} - premium ${premium:.0f} < ${self.min_premium:.0f}")
+                        continue
+                    
+                    # Always ensure we have next day data for consistency across strategies
+                    if not self.has_next_day_data(underlying_symbol, alert['executed_time']):
+                        print(f"    Filtered out {underlying_symbol} - no next day data (for consistency)")
+                        continue
+                    
+                    valid_alerts.append(alert)
                 
-                # Take top 10 or all if less than 10
-                top_alerts = valid_alerts[:10]
+                valid_alerts.sort(key=lambda x: x['executed_time'])
                 
-                print(f"Day {date}: {len(alerts_list)} total alerts, {len(valid_alerts)} valid, selected top {len(top_alerts)}")
+                # Take first N by time order (not by score)
+                first_n_alerts = valid_alerts[:self.max_trades_per_day]
                 
-                for i, alert_info in enumerate(top_alerts):
-                    print(f"  #{i+1}: {alert_info['alert']['meta']['underlying_symbol']} "
-                          f"(score: {alert_info['score']:.0f}, premium: ${float(alert_info['alert']['meta']['total_premium']):,.0f})")
+                print(f"Day {date}: {len(alerts_list)} total alerts, {len(valid_alerts)} valid (premium >= ${self.min_premium:.0f}, next day data available), selected first {len(first_n_alerts)} by time")
+                
+                for i, alert_info in enumerate(first_n_alerts):
+                    premium = float(alert_info['alert']['meta']['total_premium'])
+                    print(f"  #{i+1}: {alert_info['executed_time'].strftime('%H:%M')} - {alert_info['alert']['meta']['underlying_symbol']} "
+                          f"(premium: ${premium:,.0f})")
                     selected_alerts.append(alert_info)
         
         return selected_alerts
@@ -232,6 +235,30 @@ class OptionFlowBacktester:
         
         return open_price, open_time
     
+    def has_next_day_data(self, symbol: str, trade_date: datetime) -> bool:
+        """Check if symbol has next day trading data"""
+        next_day_open, _ = self.get_next_trading_day_open(symbol, trade_date)
+        return next_day_open is not None
+    
+    def get_same_day_close(self, symbol: str, entry_time: datetime, trade_date: datetime) -> tuple:
+        """Get the closing price of the same trading day"""
+        if symbol not in self.price_data:
+            return None, None
+            
+        df = self.price_data[symbol]
+        
+        # Get same day prices after entry time
+        same_day_prices = df[(df.index >= entry_time) & (df.index.date == trade_date.date())]
+        
+        if same_day_prices.empty:
+            return None, None
+        
+        # Get the last price of the day
+        close_price = same_day_prices.iloc[-1]['Open']  # Use Open price
+        close_time = same_day_prices.index[-1]
+        
+        return close_price, close_time
+    
     def is_after_hours(self, trade_time: datetime) -> bool:
         """Check if the trade time is after market hours (after 4:00 PM ET)"""
         # Market closes at 4:00 PM ET
@@ -240,98 +267,115 @@ class OptionFlowBacktester:
     
     def determine_trade_direction(self, alert: Dict) -> str:
         """
-        Determine if the option trade is long or short based on price vs bid/ask and option type
-        For Call options: price closer to ask = buy call (long), price closer to bid = sell call (short)
-        For Put options: price closer to ask = buy put (short), price closer to bid = sell put (long)
+        Determine if the option trade is long or short based on bid/ask volume or price
+        For Call options: buy call = long, sell call = short
+        For Put options: buy put = short, sell put = long
         Returns: 'long' or 'short'
         """
         try:
+            option_symbol = alert.get('symbol', '')
+            # More accurate option type detection
+            if re.search(r'\d{6}P\d', option_symbol):  # 6 digits + P + digits
+                is_put = True
+            elif re.search(r'\d{6}C\d', option_symbol):  # 6 digits + C + digits
+                is_put = False
+            else:
+                # Fallback to simple check
+                is_put = 'P' in option_symbol
+            
+            # First try to use bid_volume and ask_volume (newer data format)
+            bid_volume = alert['meta'].get('bid_volume', 0)
+            ask_volume = alert['meta'].get('ask_volume', 0)
+            
+            if bid_volume is not None and ask_volume is not None and (bid_volume > 0 or ask_volume > 0):
+                # Use volume to determine trade direction (more reliable)
+                is_bid_trade = bid_volume > ask_volume  # More volume on bid = seller behavior
+                trade_type = "SELL" if is_bid_trade else "BUY"
+                
+                if is_put:
+                    # PUT: sell put (bid) = long, buy put (ask) = short
+                    direction = 'long' if is_bid_trade else 'short'
+                    print(f"    Volume-based: {trade_type} PUT (bid_vol={bid_volume}, ask_vol={ask_volume}) -> {direction.upper()}")
+                    return direction
+                else:
+                    # CALL: buy call (ask) = long, sell call (bid) = short
+                    direction = 'short' if is_bid_trade else 'long'
+                    print(f"    Volume-based: {trade_type} CALL (bid_vol={bid_volume}, ask_vol={ask_volume}) -> {direction.upper()}")
+                    return direction
+            
+            # Fallback to price vs bid/ask method (older data format)
             price = float(alert['meta'].get('price', 0))
             bid = float(alert['meta'].get('bid', 0))
             ask = float(alert['meta'].get('ask', 0))
-            option_symbol = alert.get('symbol', '')
             
             if price == 0 or (bid == 0 and ask == 0):
-                # Default to long if we can't determine
-                return 'long'
-            
-            # Determine if it's a call or put option
-            is_put = 'P' in option_symbol  # Put options have 'P' in symbol, calls have 'C'
+                return 'long'  # Default to long if we can't determine
             
             # Calculate mid-point and determine if closer to bid or ask
             if bid > 0 and ask > 0:
                 closer_to_ask = abs(price - ask) < abs(price - bid)
+                trade_type = "BUY" if closer_to_ask else "SELL"
                 
                 if is_put:
-                    # For PUT options:
-                    # Price closer to ask = buy put (short underlying)
-                    # Price closer to bid = sell put (long underlying)
-                    return 'short' if closer_to_ask else 'long'
+                    # PUT: price closer to ask = buy put (short), price closer to bid = sell put (long)
+                    direction = 'short' if closer_to_ask else 'long'
+                    print(f"    Price-based: {trade_type} PUT (price=${price:.2f}, bid=${bid:.2f}, ask=${ask:.2f}) -> {direction.upper()}")
+                    return direction
                 else:
-                    # For CALL options:
-                    # Price closer to ask = buy call (long underlying)
-                    # Price closer to bid = sell call (short underlying)
-                    return 'long' if closer_to_ask else 'short'
+                    # CALL: price closer to ask = buy call (long), price closer to bid = sell call (short)
+                    direction = 'long' if closer_to_ask else 'short'
+                    print(f"    Price-based: {trade_type} CALL (price=${price:.2f}, bid=${bid:.2f}, ask=${ask:.2f}) -> {direction.upper()}")
+                    return direction
             
-            # Fallback: if price < bid, it's likely a sell
-            if bid > 0 and price < bid:
-                return 'short' if not is_put else 'long'
-            
-            # Default to long
+            # Final fallback
             return 'long'
             
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            print(f"Error determining trade direction: {e}")
             return 'long'
     
-    def monitor_trade_new_exit_rule(self, symbol: str, entry_price: float, entry_time: datetime, 
-                                   trade_date: datetime, trade_direction: str = 'long') -> Dict:
-        """Monitor trade with new exit rule: sell next day open if available, otherwise current day close"""
+    def monitor_trade_exit(self, symbol: str, entry_price: float, entry_time: datetime, 
+                          trade_date: datetime, trade_direction: str = 'long') -> Dict:
+        """Monitor trade with configurable exit strategy"""
         if symbol not in self.price_data:
             return None
             
-        df = self.price_data[symbol]
-        
-        # First, try to get next day open price
-        next_day = trade_date.date() + timedelta(days=1)
-        et_tz = pytz.timezone('US/Eastern')
-        
-        # Look for next trading day prices (starting from 9:30 AM ET)
-        next_day_start = et_tz.localize(datetime.combine(next_day, datetime.min.time().replace(hour=9, minute=30)))
-        next_day_prices = df[df.index >= next_day_start]
-        
-        # Check if we have next day data
-        if not next_day_prices.empty:
-            # We have next day data, exit at next day open
-            exit_price = next_day_prices.iloc[0]['Open']
-            exit_time = next_day_prices.index[0]
-            exit_reason = 'next_day_open'
-            
-            print(f"  -> Exiting at next day open: {exit_price:.2f} at {exit_time}")
-            
-            return {
-                'exit_price': exit_price,
-                'exit_time': exit_time,
-                'exit_reason': exit_reason
-            }
-        else:
-            # No next day data, exit at current day close
-            same_day_prices = df[(df.index >= entry_time) & (df.index.date == trade_date.date())]
-            
-            if same_day_prices.empty:
+        if self.exit_strategy == 'next_day_open':
+            # Next day open strategy
+            next_day_open, next_day_time = self.get_next_trading_day_open(symbol, trade_date)
+            if next_day_open is not None:
+                print(f"  -> Exiting at next day open: {next_day_open:.2f} at {next_day_time}")
+                return {
+                    'exit_price': next_day_open,
+                    'exit_time': next_day_time,
+                    'exit_reason': 'next_day_open'
+                }
+            else:
+                print(f"  -> No next day data available for {symbol}")
                 return None
-            
-            # Exit at end of current day using Open price
-            final_price = same_day_prices.iloc[-1]['Open']
-            final_time = same_day_prices.index[-1]
-            exit_reason = 'current_day_close'
-            
-            print(f"  -> No next day data, exiting at current day close: {final_price:.2f} at {final_time}")
-            
-            return {
-                'exit_price': final_price,
-                'exit_time': final_time,
-                'exit_reason': exit_reason
-            }
+        
+        elif self.exit_strategy == 'same_day_close':
+            # Same day close strategy
+            close_price, close_time = self.get_same_day_close(symbol, entry_time, trade_date)
+            if close_price is not None:
+                print(f"  -> Exiting at same day close: {close_price:.2f} at {close_time}")
+                return {
+                    'exit_price': close_price,
+                    'exit_time': close_time,
+                    'exit_reason': 'same_day_close'
+                }
+            else:
+                print(f"  -> No same day close data available for {symbol}")
+                return None
+        
+        else:
+            raise ValueError(f"Unknown exit strategy: {self.exit_strategy}")
+    
+    # Keep the old function for backward compatibility
+    def monitor_trade_new_exit_rule(self, symbol: str, entry_price: float, entry_time: datetime, 
+                                   trade_date: datetime, trade_direction: str = 'long') -> Dict:
+        """Legacy function - use monitor_trade_exit instead"""
+        return self.monitor_trade_exit(symbol, entry_price, entry_time, trade_date, trade_direction)
     
     def run_backtest(self) -> Dict:
         """Run the backtesting strategy"""
@@ -346,8 +390,8 @@ class OptionFlowBacktester:
         
         print(f"Found {len(flow_alerts)} 'Flow alerts for All' alerts")
         
-        print("Selecting top 10 abnormal alerts per day...")
-        selected_alerts = self.select_top_abnormal_per_day(flow_alerts)
+        print(f"Selecting first {self.max_trades_per_day} alerts per day by time order (minimum premium: ${self.min_premium:.0f}, exit strategy: {self.exit_strategy})...")
+        selected_alerts = self.select_first_n_per_day(flow_alerts)
         
         print(f"Selected {len(selected_alerts)} alerts for backtesting")
         
@@ -371,9 +415,27 @@ class OptionFlowBacktester:
                 option_price = float(alert['meta'].get('price', 0))
                 bid = float(alert['meta'].get('bid', 0))
                 ask = float(alert['meta'].get('ask', 0))
+                bid_volume = alert['meta'].get('bid_volume', 'N/A')
+                ask_volume = alert['meta'].get('ask_volume', 'N/A')
                 option_symbol = alert.get('symbol', '')
-                option_type = 'PUT' if 'P' in option_symbol else 'CALL'
-                print(f"Option details: {option_type} price=${option_price:.2f}, bid=${bid:.2f}, ask=${ask:.2f} -> {trade_direction.upper()}")
+                # Determine option type from symbol (more accurate parsing)
+                # Format: SYMBOL + YYMMDD + C/P + STRIKE
+                # Example: MCHP250808C00069000
+                if re.search(r'\d{6}P\d', option_symbol):  # 6 digits + P + digits
+                    option_type = 'PUT'
+                elif re.search(r'\d{6}C\d', option_symbol):  # 6 digits + C + digits  
+                    option_type = 'CALL'
+                else:
+                    # Fallback to simple check
+                    option_type = 'PUT' if 'P' in option_symbol else 'CALL'
+                
+                # Show volume info if available
+                if bid_volume != 'N/A' and ask_volume != 'N/A':
+                    volume_info = f", bid_vol={bid_volume}, ask_vol={ask_volume}"
+                else:
+                    volume_info = f", bid=${bid:.2f}, ask=${ask:.2f}"
+                
+                print(f"Option details: {option_type} price=${option_price:.2f}{volume_info} -> {trade_direction.upper()}")
                 
                 # Check if this is an after-hours signal
                 if self.is_after_hours(executed_time):
@@ -381,21 +443,24 @@ class OptionFlowBacktester:
                     # Use next trading day open price
                     buy_price, actual_buy_time = self.get_next_trading_day_open(underlying_symbol, executed_time)
                     if buy_price is None:
-                        print(f"Skipping {underlying_symbol} - no next day open price available")
+                        print(f"❌ CRITICAL ERROR: {underlying_symbol} - no next day open price available for after-hours trade")
                         continue
                     buy_time = actual_buy_time
                     trade_date = buy_time.date()
+                    print(f"✅ After-hours trade: {underlying_symbol} buy at {buy_price:.2f} on {buy_time}")
                 else:
                     # Normal intraday signal
                     buy_price = self.get_price_at_time(underlying_symbol, buy_time)
                     if buy_price is None:
-                        print(f"Skipping {underlying_symbol} - no buy price available")
+                        print(f"❌ CRITICAL ERROR: {underlying_symbol} - no buy price available for intraday trade at {buy_time}")
                         continue
+                    print(f"✅ Intraday trade: {underlying_symbol} buy at {buy_price:.2f} at {buy_time}")
                 
-                # Monitor trade with new exit rule
-                exit_info = self.monitor_trade_new_exit_rule(underlying_symbol, buy_price, buy_time, buy_time, trade_direction)
+                # Monitor trade with configured exit strategy
+                exit_info = self.monitor_trade_exit(underlying_symbol, buy_price, buy_time, buy_time, trade_direction)
                 if exit_info is None:
-                    print(f"Skipping {underlying_symbol} - no exit price available")
+                    print(f"❌ CRITICAL ERROR: {underlying_symbol} - no exit price available ({self.exit_strategy})")
+                    print(f"   Trade date: {buy_time.date()}, Entry time: {buy_time}")
                     continue
                 
                 sell_price = exit_info['exit_price']
@@ -423,7 +488,6 @@ class OptionFlowBacktester:
                     'return_pct': return_pct,
                     'exit_reason': exit_reason,
                     'alert_id': alert['id'],
-                    'abnormality_score': alert_info['score'],
                     'trade_direction': trade_direction,
                     'option_type': option_type,
                     'option_symbol': option_symbol,
@@ -439,19 +503,20 @@ class OptionFlowBacktester:
                 print(f"Error processing alert {alert.get('id', 'unknown')}: {e}")
                 continue
         
-        # Calculate position sizes: 20% each, max 5 trades per day
+        # Calculate position sizes based on max_trades_per_day
         
         for date, day_trades in daily_trades.items():
             num_trades = len(day_trades)
             
-            # If more than 5 trades, select only top 5 by abnormality score
-            if num_trades > 5:
-                day_trades.sort(key=lambda x: x['abnormality_score'], reverse=True)
-                day_trades = day_trades[:5]
-                print(f"Date {date}: Limited from {num_trades} to 5 trades (selected top 5 by score)")
-                num_trades = 5
+            # Position size is 1 / max_trades_per_day (e.g., 25% for 4 trades, 20% for 5 trades)
+            position_size = 1.0 / self.max_trades_per_day
+            max_trades = self.max_trades_per_day
             
-            position_size = 0.2  # Always 20% each (up to 5 trades per day)
+            if num_trades > max_trades:
+                print(f"Warning: Date {date} has {num_trades} trades, but should only have {max_trades}")
+                # This shouldn't happen since we select first N by time
+                day_trades = day_trades[:max_trades]
+                num_trades = max_trades
             
             print(f"Date {date}: {num_trades} trades, {position_size:.1%} each")
             
@@ -517,19 +582,37 @@ class OptionFlowBacktester:
         # Show all trades
         print("\nAll Trades:")
         print("-" * 150)
-        print(f"{'Date':<12} {'Symbol':<6} {'Type':<5} {'Dir':<5} {'Buy Time':<17} {'Buy Price':<10} {'Sell Price':<10} {'Return':<8} {'Exit Reason':<15} {'Score':<8}")
-        print("-" * 150)
+        print(f"{'Date':<12} {'Symbol':<6} {'Type':<5} {'Dir':<5} {'Buy Time':<17} {'Buy Price':<10} {'Sell Price':<10} {'Return':<8} {'Exit Reason':<15}")
+        print("-" * 140)
         
         for trade in results['trades']:
             direction = trade.get('trade_direction', 'long').upper()[:4]
             option_type = trade.get('option_type', 'CALL')[:4]  # Show first 4 chars (CALL/PUT)
             buy_time_str = trade['buy_time'].strftime('%m-%d %H:%M')  # Format as MM-DD HH:MM
             print(f"{trade['date']!s:<12} {trade['symbol']:<6} {option_type:<5} {direction:<5} {buy_time_str:<17} {trade['buy_price']:<10.2f} "
-                  f"{trade['sell_price']:<10.2f} {trade['return_pct']:<8.2%} {trade['exit_reason']:<15} {trade['abnormality_score']:<8.0f}")
+                  f"{trade['sell_price']:<10.2f} {trade['return_pct']:<8.2%} {trade['exit_reason']:<15}")
 
 def main():
-    # Initialize backtester
-    backtester = OptionFlowBacktester('alert_data', 'price_data')
+    # Initialize backtester with configurable parameters
+    # You can change max_trades_per_day to test different strategies:
+    # - 4 trades per day = 25% position size each
+    # - 5 trades per day = 20% position size each  
+    # - 3 trades per day = 33.3% position size each
+    max_trades_per_day = 4  # Change this value to test different strategies
+    
+    # Filter by minimum premium: 500000 = $500,000
+    min_premium = 500000  # Only select alerts with premium >= $500,000
+    
+    # Exit strategy: 'next_day_open' or 'same_day_close'
+    # Both strategies use the same stock universe (only stocks with both current and next day data)
+    # next_day_open: Exit at next trading day's open
+    # same_day_close: Exit at same day's close
+    exit_strategy = 'next_day_open'  # Change this to test different exit strategies
+    
+    backtester = OptionFlowBacktester('alert_data', 'price_data', 
+                                     max_trades_per_day=max_trades_per_day,
+                                     min_premium=min_premium,
+                                     exit_strategy=exit_strategy)
     
     # Run backtest
     results = backtester.run_backtest()
@@ -538,7 +621,8 @@ def main():
     backtester.print_results(results)
     
     # Save detailed results to JSON
-    with open('backtest_results_v3.json', 'w') as f:
+    filename = f'backtest_results_v4_time_order_max{max_trades_per_day}_min{int(min_premium)}_{exit_strategy}.json'
+    with open(filename, 'w') as f:
         # Convert datetime objects to strings for JSON serialization
         json_results = results.copy()
         for trade in json_results['trades']:
@@ -549,7 +633,7 @@ def main():
         
         json.dump(json_results, f, indent=2, default=str)
     
-    print(f"\nDetailed results saved to 'backtest_results_v3.json'")
+    print(f"\nDetailed results saved to '{filename}'")
 
 if __name__ == "__main__":
     main() 
