@@ -79,7 +79,7 @@ class AlertMonitor:
             'is_otm': 'true',
             'max_diff': '1',           # Max % OTM: 1
             'min_diff': '0.01',        # Min % OTM: 0.01
-            'max_dte': '200',           # Max DTE: 60
+            'max_dte': '200',           # Max DTE: 200
             'min_premium': '100000',   # Min Premium: 100000
             'min_volume_oi_ratio': '1', # Volume > OI (volume/oi > 1)
             'issue_types[]': ['Common Stock', 'ETF', 'Index', 'ADR'],

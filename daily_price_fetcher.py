@@ -142,7 +142,7 @@ class DailyPriceFetcher:
         # Return True if any criteria is met
         return any(unusual_criteria)
     
-    def fetch_price_data(self, symbol: str, days_back: int = 30, max_retries: int = 3) -> pd.DataFrame:
+    def fetch_price_data(self, symbol: str, days_back: int = 5, max_retries: int = 3) -> pd.DataFrame:
         """Fetch 5-minute price data for a symbol with retry mechanism"""
         for attempt in range(max_retries):
             try:
@@ -246,7 +246,7 @@ class DailyPriceFetcher:
         except Exception as e:
             self.logger.error(f"Failed to create summary report: {e}")
     
-    def run_daily_fetch(self, days_back: int = 7, price_days: int = 30):
+    def run_daily_fetch(self, days_back: int = 5, price_days: int = 5):
         """Run the daily price fetching process"""
         self.logger.info("Starting daily price fetching process...")
         
@@ -294,7 +294,7 @@ class DailyPriceFetcher:
         
         self.logger.info(f"Daily price fetching completed. Processed {processed_count} symbols.")
     
-    def run_update_mode(self, price_days: int = 2):
+    def run_update_mode(self, price_days: int = 3):
         """Run in update mode - update existing symbols with recent data"""
         self.logger.info("Running in update mode...")
         
