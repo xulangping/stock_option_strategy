@@ -189,7 +189,7 @@ class OptionFlowBacktestV2:
         
         # Calculate position size based on option premium
         # Position size = option premium / 1000 (e.g., 100k premium = 10% position)
-        position_pct = min(option_premium / 1000, 0.10)  # Cap at 20% per position
+        position_pct = min(option_premium / 1000000, 0.3)  # Cap at 20% per position
         
         # Check daily position limit
         date = signal_time.date()
@@ -308,7 +308,7 @@ class OptionFlowBacktestV2:
             print(f"  Signal time (UTC-4): {signal_time}")
             
             # Skip if signal is too close to market close (after 3:55 PM)
-            if signal_time.hour == 15 and signal_time.minute >= 55:
+            if signal_time.hour == 15 and signal_time.minute >= 58:
                 print(f"  Skipping - signal too close to market close")
                 continue
             
