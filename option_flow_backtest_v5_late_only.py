@@ -33,13 +33,14 @@ class OptionFlowBacktestV5:
         self.take_profit = 0.25
         self.stop_loss = -0.1
         self.blacklist_days = 5  # Don't buy same stock for 5 days
-        
+        self.entry_delay = 5  # Delay in minutes for entry
         # Late trading parameters
-        self.trade_start_time = (15, 30)  # Only trade after 3:45 PM
+        self.trade_start_time = (15, 30)  # Only trade after 3:30 PM
         
         # Transaction costs
         self.commission_per_share = 0.005  # $0.005 per share
         self.min_commission = 1.0  # Minimum $1 per trade
+        self.slippage = 0.001  # 0.1% slippage per side (0.2% round trip)
         
         # Data paths
         self.stock_data_dir = "stock_data"
@@ -144,17 +145,25 @@ class OptionFlowBacktestV5:
         return pd.DataFrame()
     
     def execute_trade(self, symbol: str, signal_time: datetime, action: str, price: float, shares: int = 0):
-        """Execute and record trades with commission"""
+        """Execute and record trades with commission and slippage"""
         commission = self.calculate_commission(shares)
+        
+        # Apply slippage
+        if action == 'BUY':
+            actual_price = price * (1 + self.slippage)  # Pay more when buying
+        else:
+            actual_price = price * (1 - self.slippage)  # Receive less when selling
         
         trade = {
             'symbol': symbol,
             'time': signal_time,
             'action': action,
             'price': price,
+            'actual_price': actual_price,
             'shares': shares,
-            'gross_value': price * shares,
-            'commission': commission
+            'gross_value': actual_price * shares,
+            'commission': commission,
+            'slippage_cost': abs(actual_price - price) * shares
         }
         
         if action == 'BUY':
@@ -179,12 +188,16 @@ class OptionFlowBacktestV5:
             if symbol in self.positions:
                 entry_price = self.positions[symbol]['entry_price']
                 buy_commission = self.calculate_commission(shares)
+                buy_slippage = entry_price * self.slippage * shares
+                sell_slippage = trade['slippage_cost']
                 total_commission = buy_commission + commission
+                total_slippage = buy_slippage + sell_slippage
                 
+                # Calculate P&L including slippage
                 trade['gross_pnl'] = (price - entry_price) * shares
-                trade['net_pnl'] = trade['gross_pnl'] - total_commission
+                trade['net_pnl'] = trade['gross_pnl'] - total_commission - total_slippage
                 trade['gross_return'] = (price - entry_price) / entry_price
-                trade['net_return'] = trade['net_pnl'] / (entry_price * shares + buy_commission)
+                trade['net_return'] = trade['net_pnl'] / (entry_price * shares + buy_commission + buy_slippage)
                 del self.positions[symbol]
         
         self.trades_history.append(trade)
@@ -196,7 +209,7 @@ class OptionFlowBacktestV5:
             return False
         
         # Find the first bar at or after signal time + 1 minute
-        entry_time_target = signal_time + timedelta(minutes=1)
+        entry_time_target = signal_time + timedelta(minutes=self.entry_delay)
         
         # Find the first bar that is at or after the target entry time AND during regular hours
         entry_idx = None
@@ -270,7 +283,8 @@ class OptionFlowBacktestV5:
         self.daily_position_used[date] += position_pct
         
         # Execute buy
-        print(f"  [BUY] {symbol}: {shares} shares @ ${entry_price:.2f} at {entry_time} (Position: {position_pct:.1%})")
+        actual_buy_price = entry_price * (1 + self.slippage)
+        print(f"  [BUY] {symbol}: {shares} shares @ ${entry_price:.2f} (actual: ${actual_buy_price:.2f}) at {entry_time} (Position: {position_pct:.1%})")
         self.execute_trade(symbol, entry_time, 'BUY', entry_price, shares)
         
         # Add to blacklist for 5 days
@@ -357,8 +371,13 @@ class OptionFlowBacktestV5:
             
             print(f"  Signal time (UTC-4): {signal_time}")
             
+            # # skip friday
+            # if signal_time.weekday() == 4:
+            #     print(f"  Skipping - Friday")
+            #     continue
+            
             # Skip if signal is too close to market close (after 3:58 PM)
-            if signal_time.hour == 15 and signal_time.minute >= 58:
+            if signal_time.hour == 15 and signal_time.minute >= 59 - self.entry_delay:
                 print(f"  Skipping - signal too close to market close")
                 continue
             
@@ -414,6 +433,7 @@ class OptionFlowBacktestV5:
         total_gross_pnl = sum(trade.get('gross_pnl', 0) for trade in self.trades_history)
         total_net_pnl = sum(trade.get('net_pnl', 0) for trade in self.trades_history)
         total_commission = sum(trade.get('commission', 0) for trade in self.trades_history)
+        total_slippage = sum(trade.get('slippage_cost', 0) for trade in self.trades_history)
         total_return = (self.capital - self.initial_capital) / self.initial_capital
         
         # Get winning and losing trades
@@ -446,6 +466,7 @@ class OptionFlowBacktestV5:
         print(f"Final Capital: ${self.capital:,.2f}")
         print(f"Gross P&L: ${total_gross_pnl:,.2f}")
         print(f"Total Commission: ${total_commission:,.2f}")
+        print(f"Total Slippage: ${total_slippage:,.2f}")
         print(f"Net P&L: ${total_net_pnl:,.2f}")
         print(f"Total Return: {total_return:.2%}")
         
