@@ -1,0 +1,2 @@
+date,time,ticker,underlying_symbol,underlying_price,option_type,expiry,strike,bid,ask,last,volume,open_interest,implied_volatility,delta,gamma,theta,vega,premium
+2025-09-26,03:35:00,AAPL250926C00230000,AAPL,228.50,CALL,2025-09-26,230.00,0.85,0.90,0.88,5000,2500,0.25,0.35,0.08,-0.15,0.12,88000

@@ -47,7 +47,6 @@ alert_monitor.log
 # 数据文件
 alert_data/
 *.json
-*.csv
 
 # 系统文件
 .DS_Store
