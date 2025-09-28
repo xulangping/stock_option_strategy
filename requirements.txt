@@ -2,3 +2,6 @@ pandas==2.0.3
 numpy==1.24.3
 requests==2.31.0
 polygon-api-client==1.13.0
+pytz==2024.1
+futu-api==7.0.0
+openai==1.35.0

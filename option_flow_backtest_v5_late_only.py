@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import time
 from typing import Dict, List, Tuple, Optional
 import os
+import pytz
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -30,9 +31,9 @@ class OptionFlowBacktestV5:
         self.max_daily_trades = 4  # Max 4 trades per day
         self.max_daily_position = 0.80  # Max 80% position per day
         self.min_cash_ratio = 0.20
-        self.take_profit = 0.25
+        self.take_profit = 0.2
         self.stop_loss = -0.1
-        self.blacklist_days = 5  # Don't buy same stock for 5 days
+        self.blacklist_days = 15  # Don't buy same stock for 5 days
         self.entry_delay = 5  # Delay in minutes for entry
         # Late trading parameters
         self.trade_start_time = (15, 30)  # Only trade after 3:30 PM
@@ -50,18 +51,27 @@ class OptionFlowBacktestV5:
         return max(shares * self.commission_per_share, self.min_commission)
         
     def convert_option_time_to_market_time(self, date_str: str, time_str: str) -> datetime:
-        """Convert UTC+8 to UTC-4 and handle date adjustment"""
+        """Convert UTC+8 (Beijing time) to ET (New York time) and handle date adjustment"""
+        # Parse the datetime string
         option_datetime = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
         
-        # Check if time is before 12:00:00
+        # Check if time is before 12:00:00 (means it's next day in Beijing time)
         hour = int(time_str.split(':')[0])
         if hour < 12:
             option_datetime = option_datetime + timedelta(days=1)
         
-        # Convert from UTC+8 to UTC-4
-        market_datetime = option_datetime - timedelta(hours=12)
+        # Create timezone objects
+        beijing_tz = pytz.timezone('Asia/Shanghai')  # UTC+8
+        ny_tz = pytz.timezone('America/New_York')  # ET (automatically handles EDT/EST)
         
-        return market_datetime
+        # Localize to Beijing timezone
+        beijing_time = beijing_tz.localize(option_datetime)
+        
+        # Convert to New York timezone
+        ny_time = beijing_time.astimezone(ny_tz)
+        
+        # Return as naive datetime for consistency with rest of the code
+        return ny_time.replace(tzinfo=None)
     
     def get_next_trading_day_open(self, current_time: datetime) -> datetime:
         """Get next trading day at market open (9:30 AM ET)"""
@@ -218,7 +228,7 @@ class OptionFlowBacktestV5:
                 # Check if it's during regular market hours (9:30 AM - 4:00 PM ET)
                 hour = row['datetime'].hour
                 minute = row['datetime'].minute
-                if (hour == 9 and minute >= 30) or (10 <= hour < 16):
+                if (hour == 9 and minute >= 30) or (10 <= hour <= 16):
                     entry_idx = idx
                     break
         
@@ -250,7 +260,7 @@ class OptionFlowBacktestV5:
             return False
         
         # Calculate position size based on option premium
-        position_pct = min(option_premium / 800000, 0.4)  # Cap at 30% per position
+        position_pct = min(option_premium / 800000, 0.6)  # Cap at 30% per position
         
         # Check daily position limit
         date = signal_time.date()
@@ -369,17 +379,13 @@ class OptionFlowBacktestV5:
             signal_time = row['market_time']
             symbol = row['underlying_symbol']
             
-            print(f"  Signal time (UTC-4): {signal_time}")
+            print(f"  Signal time (ET): {signal_time}")
             
-            # # skip friday
-            # if signal_time.weekday() == 4:
-            #     print(f"  Skipping - Friday")
-            #     continue
             
             # Skip if signal is too close to market close (after 3:58 PM)
-            if signal_time.hour == 15 and signal_time.minute >= 59 - self.entry_delay:
-                print(f"  Skipping - signal too close to market close")
-                continue
+            # if signal_time.hour == 15 and signal_time.minute >= 59 - self.entry_delay:
+            #     print(f"  Skipping - signal too close to market close")
+            #     continue
             
             # Skip if in blacklist
             if symbol in self.stock_blacklist and signal_time.date() <= self.stock_blacklist[symbol]:
@@ -508,7 +514,7 @@ def main():
     backtest = OptionFlowBacktestV5(initial_capital=100000)
     
     # Run backtest with the merged option data
-    option_file = "option_data/merged_deduplicated_2025M1_M9.csv"
+    option_file = "option_data/merged_deduplicated_2023M3_2025M9_all.csv"
     
     backtest.run_backtest(option_file)
     

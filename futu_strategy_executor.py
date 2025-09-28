@@ -17,6 +17,7 @@ from futu import *
 import logging
 from pathlib import Path
 import threading
+import pytz
 
 warnings.filterwarnings('ignore')
 
@@ -56,8 +57,8 @@ class FutuStrategyExecutor:
         self.max_daily_trades = 4
         self.max_daily_position = 0.80
         self.min_cash_ratio = 0.20
-        self.take_profit = 0.25
-        self.stop_loss = -0.10
+        # self.take_profit = 0.25  # No longer using take profit
+        # self.stop_loss = -0.10   # No longer using stop loss
         self.blacklist_days = 5
         self.entry_delay_minutes = 5
         self.trade_start_time = (15, 30)  # 3:30 PM
@@ -66,6 +67,10 @@ class FutuStrategyExecutor:
         self.option_folder = "real_time_option"
         self.processed_files = set()
         self.state_file = "futu_executor_state.json"
+        
+        # Store timers for each position
+        self.exit_timers = {}
+        self.entry_timers = {}
         
         # Load previous state if exists
         self.load_state()
@@ -140,18 +145,27 @@ class FutuStrategyExecutor:
             logger.error(f"Failed to save state: {e}")
     
     def convert_option_time_to_market_time(self, date_str: str, time_str: str) -> datetime:
-        """Convert UTC+8 to UTC-4 (ET) and handle date adjustment"""
+        """Convert UTC+8 option data time to US Eastern Time"""
         option_datetime = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
         
-        # Check if time is before 12:00:00
+        # Fix the date issue: times before 12:00:00 need to add one day
         hour = int(time_str.split(':')[0])
         if hour < 12:
             option_datetime = option_datetime + timedelta(days=1)
         
-        # Convert from UTC+8 to UTC-4 (12 hour difference)
-        market_datetime = option_datetime - timedelta(hours=12)
+        # Now option_datetime is correct UTC+8 time
+        # Convert to US Eastern Time
+        utc8_tz = pytz.timezone('Asia/Shanghai')
+        et_tz = pytz.timezone('US/Eastern')
         
-        return market_datetime
+        # Localize to UTC+8
+        utc8_time = utc8_tz.localize(option_datetime)
+        
+        # Convert to ET (handles DST automatically)
+        et_time = utc8_time.astimezone(et_tz)
+        
+        # Return as naive datetime in ET
+        return et_time.replace(tzinfo=None)
     
     def is_late_trade_time(self, signal_time: datetime) -> bool:
         """Check if signal is after 3:30 PM ET"""
@@ -193,6 +207,55 @@ class FutuStrategyExecutor:
             # Don't log error, just return 0 (no quote permission)
             return 0.0
     
+    def schedule_next_day_exit(self, symbol: str, shares: int, entry_time: datetime):
+        """Schedule automatic exit at next day 3:00 PM ET"""
+        # entry_time is in ET (from convert_option_time_to_market_time)
+        # Calculate next trading day 3:00 PM ET
+        exit_time_et = entry_time.replace(hour=15, minute=0, second=0, microsecond=0)
+        exit_time_et = exit_time_et + timedelta(days=1)
+        
+        # Convert ET exit time to local UTC+8 time
+        et_tz = pytz.timezone('US/Eastern')
+        local_tz = pytz.timezone('Asia/Shanghai')
+        
+        # Localize to ET
+        exit_time_et_aware = et_tz.localize(exit_time_et)
+        
+        # Convert to local time (UTC+8)
+        exit_time_local = exit_time_et_aware.astimezone(local_tz)
+        
+        # Calculate seconds until exit
+        now_local = datetime.now(local_tz)
+        wait_seconds = (exit_time_local - now_local).total_seconds()
+        
+        if wait_seconds > 0:
+            logger.info(f"Scheduling exit for {symbol} at {exit_time_et} ET ({exit_time_local.strftime('%Y-%m-%d %H:%M:%S')} local)")
+            
+            # Create timer for scheduled exit
+            timer = threading.Timer(wait_seconds, self.execute_scheduled_exit, 
+                                  args=[symbol, shares])
+            timer.daemon = True
+            timer.start()
+            
+            # Store timer reference (cancel old timer if exists)
+            if symbol in self.exit_timers:
+                self.exit_timers[symbol].cancel()
+            self.exit_timers[symbol] = timer
+        else:
+            logger.warning(f"Exit time for {symbol} has already passed")
+    
+    def execute_scheduled_exit(self, symbol: str, shares: int):
+        """Execute the scheduled 3PM exit"""
+        try:
+            logger.info(f"[SCHEDULED 3PM EXIT] Executing exit for {symbol}")
+            self.place_sell_order(symbol, shares, "3PM_EXIT")
+            
+            # Remove timer reference
+            if symbol in self.exit_timers:
+                del self.exit_timers[symbol]
+        except Exception as e:
+            logger.error(f"Error executing scheduled exit for {symbol}: {e}")
+    
     def place_buy_order(self, symbol: str, shares: int, signal_time: datetime) -> str:
         """Place a market buy order"""
         symbol = self.format_us_symbol(symbol)
@@ -221,6 +284,9 @@ class FutuStrategyExecutor:
                     'shares': shares,
                     'entry_price': 0  # Will be updated when order fills
                 }
+                
+                # Schedule next day 3PM exit
+                self.schedule_next_day_exit(symbol, shares, signal_time)
                 
                 # Update daily trades count
                 date = datetime.now().date()
@@ -265,6 +331,12 @@ class FutuStrategyExecutor:
                 if symbol in self.positions:
                     del self.positions[symbol]
                 
+                # Cancel any pending exit timer
+                if symbol in self.exit_timers:
+                    self.exit_timers[symbol].cancel()
+                    del self.exit_timers[symbol]
+                    logger.info(f"Cancelled scheduled exit timer for {symbol}")
+                
                 return order_id
             else:
                 logger.error(f"Failed to place sell order for {symbol}: {data}")
@@ -303,26 +375,26 @@ class FutuStrategyExecutor:
             # Calculate return
             returns = (current_price - entry_price) / entry_price
             
-            # Check stop loss
-            if returns <= self.stop_loss:
-                logger.info(f"[STOP LOSS TRIGGERED] {symbol}: Return = {returns:.2%}")
-                self.place_sell_order(symbol, shares, "STOP_LOSS")
-                continue
+            # # Check stop loss - DISABLED (no longer using stop loss)
+            # if returns <= self.stop_loss:
+            #     logger.info(f"[STOP LOSS TRIGGERED] {symbol}: Return = {returns:.2%}")
+            #     self.place_sell_order(symbol, shares, "STOP_LOSS")
+            #     continue
             
-            # Check take profit
-            if returns >= self.take_profit:
-                logger.info(f"[TAKE PROFIT TRIGGERED] {symbol}: Return = {returns:.2%}")
-                self.place_sell_order(symbol, shares, "TAKE_PROFIT")
-                continue
+            # # Check take profit - DISABLED (no longer using take profit)
+            # if returns >= self.take_profit:
+            #     logger.info(f"[TAKE PROFIT TRIGGERED] {symbol}: Return = {returns:.2%}")
+            #     self.place_sell_order(symbol, shares, "TAKE_PROFIT")
+            #     continue
             
-            # Check next day 3PM exit (US Eastern Time)
+            # Check next day 3PM exit (US Eastern Time) - Exit exactly at 3:00 PM
             now = datetime.now()
             entry_time = position_info['entry_time']
             
-            # If it's next trading day and after 3PM ET
-            if now.date() > entry_time.date() and now.hour >= 15:
-                logger.info(f"[NEXT DAY EXIT] {symbol}: Return = {returns:.2%}")
-                self.place_sell_order(symbol, shares, "NEXT_DAY_EXIT")
+            # If it's next trading day and at 3:00 PM ET (hour=15, minute=0)
+            if now.date() > entry_time.date() and now.hour == 15 and now.minute == 0:
+                logger.info(f"[NEXT DAY 3PM EXIT] {symbol}: Return = {returns:.2%}")
+                self.place_sell_order(symbol, shares, "NEXT_DAY_3PM_EXIT")
     
     def can_open_position(self) -> bool:
         """Check if we can open a new position"""
@@ -350,6 +422,34 @@ class FutuStrategyExecutor:
                     return False
         
         return True
+    
+    def schedule_entry_order(self, symbol: str, shares: int, signal_time: datetime, position_pct: float):
+        """Schedule the entry order to be placed 5 minutes after signal"""
+        try:
+            logger.info(f"[SCHEDULED ENTRY] Executing entry for {symbol}: {shares} shares")
+            
+            # Remove from entry timers
+            symbol_formatted = self.format_us_symbol(symbol)
+            if symbol_formatted in self.entry_timers:
+                del self.entry_timers[symbol_formatted]
+            
+            order_id = self.place_buy_order(symbol, shares, signal_time)
+            
+            if order_id:
+                # Update daily position tracking
+                date = datetime.now().date()
+                if date not in self.daily_position_used:
+                    self.daily_position_used[date] = 0
+                self.daily_position_used[date] += position_pct
+                
+                logger.info(f"Buy order placed successfully. Order ID: {order_id}")
+            else:
+                # Remove pending position if order failed
+                if symbol_formatted in self.positions:
+                    del self.positions[symbol_formatted]
+                logger.error(f"Failed to place buy order for {symbol}")
+        except Exception as e:
+            logger.error(f"Error executing scheduled entry for {symbol}: {e}")
     
     def process_option_signal(self, row: pd.Series):
         """Process a single option flow signal"""
@@ -429,37 +529,48 @@ class FutuStrategyExecutor:
             logger.info(f"Position too small: {shares} shares")
             return
         
-        # Calculate entry time (5 minutes after option signal)
-        entry_time = signal_time + timedelta(minutes=self.entry_delay_minutes)
-        now = datetime.now()
+        # Calculate entry time (5 minutes after option signal, ignore seconds)
+        entry_time = signal_time.replace(second=0, microsecond=0) + timedelta(minutes=self.entry_delay_minutes)
         
-        # Convert entry_time to local time for comparison
-        # Signal time is in ET (UTC-4), local time is UTC+8 (12 hour difference)
-        entry_time_local = entry_time + timedelta(hours=12)
+        # Convert entry_time (ET) to local time (UTC+8) for scheduling
+        et_tz = pytz.timezone('US/Eastern')
+        local_tz = pytz.timezone('Asia/Shanghai')
         
-        wait_seconds = (entry_time_local - now).total_seconds()
+        # Localize entry_time to ET
+        entry_time_et = et_tz.localize(entry_time)
+        
+        # Convert to local time
+        entry_time_local = entry_time_et.astimezone(local_tz)
+        
+        # Get current local time
+        now_local = datetime.now(local_tz)
+        
+        wait_seconds = (entry_time_local - now_local).total_seconds()
         
         if wait_seconds > 0:
             logger.info(f"Signal was at {signal_time} ET")
-            logger.info(f"Will enter at {entry_time} ET ({entry_time_local.strftime('%H:%M:%S')} local)")
-            logger.info(f"Waiting {wait_seconds:.0f} seconds...")
-            time.sleep(wait_seconds)
+            logger.info(f"Scheduling entry at {entry_time} ET ({entry_time_local.strftime('%Y-%m-%d %H:%M:%S')} local)")
+            logger.info(f"Entry will execute in {wait_seconds:.0f} seconds")
+            
+            # Schedule the entry order using Timer
+            timer = threading.Timer(wait_seconds, self.schedule_entry_order,
+                                  args=[symbol, shares, signal_time, position_pct])
+            timer.daemon = True
+            timer.start()
+            
+            # Store timer reference
+            self.entry_timers[symbol_formatted] = timer
+            
+            # Mark position as pending to avoid duplicate entries
+            self.positions[symbol_formatted] = {
+                'order_id': 'PENDING',
+                'entry_time': signal_time,
+                'shares': shares,
+                'entry_price': 0
+            }
         else:
             logger.info(f"Signal was at {signal_time} ET, entry time has passed, placing order immediately")
-        
-        # Place buy order
-        logger.info(f"Placing buy order: {symbol} - {shares} shares (Position: {position_pct:.1%})")
-        order_id = self.place_buy_order(symbol, shares, signal_time)
-        
-        if order_id:
-            # Update daily position tracking
-            if date not in self.daily_position_used:
-                self.daily_position_used[date] = 0
-            self.daily_position_used[date] += position_pct
-            
-            logger.info(f"Buy order placed successfully. Order ID: {order_id}")
-        else:
-            logger.error(f"Failed to place buy order for {symbol}")
+            self.schedule_entry_order(symbol, shares, signal_time, position_pct)
     
     def scan_for_new_files(self):
         """Scan the real_time_option folder for new CSV files"""
@@ -512,9 +623,8 @@ class FutuStrategyExecutor:
                     for filepath in new_files:
                         self.process_csv_file(filepath)
                 
-                # Check exit conditions for existing positions - DISABLED (no quote permission)
-                # if self.positions:
-                #     self.check_exit_conditions()
+                # Exit conditions are now handled by scheduled timers
+                # No need to check in the main loop
                 
                 # Reset daily counters at midnight
                 now = datetime.now()
@@ -538,6 +648,15 @@ class FutuStrategyExecutor:
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
         finally:
+            # Cancel all pending timers
+            for symbol, timer in self.entry_timers.items():
+                timer.cancel()
+                logger.info(f"Cancelled entry timer for {symbol}")
+            
+            for symbol, timer in self.exit_timers.items():
+                timer.cancel()
+                logger.info(f"Cancelled exit timer for {symbol}")
+            
             self.save_state()
             self.disconnect()
             logger.info("Executor stopped")

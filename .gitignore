@@ -43,10 +43,16 @@ env/
 # 日志文件
 *.log
 alert_monitor.log
+backtest_log.txt
+executor.log
 
 # 数据文件
 alert_data/
 *.json
+option_data/
+*.csv
+!requirements.txt  # 保留 requirements.txt
+stock_data/
 
 # 系统文件
 .DS_Store
@@ -62,6 +68,11 @@ Thumbs.db
 *.temp
 monitor.log
 nohup.out
+
+# 图片文件（回测结果图）
+*.png
+*.jpg
+*.jpeg
 
 # Jupyter Notebook
 .ipynb_checkpoints
