@@ -53,7 +53,7 @@ option_data/
 *.csv
 !requirements.txt  # 保留 requirements.txt
 stock_data/
-
+daily/
 # 系统文件
 .DS_Store
 .DS_Store?

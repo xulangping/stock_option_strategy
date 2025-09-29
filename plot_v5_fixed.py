@@ -9,6 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 import matplotlib.dates as mdates
+import yfinance as yf
 
 # 设置matplotlib参数
 plt.rcParams['figure.facecolor'] = 'white'
@@ -24,6 +25,20 @@ def plot_equity_curve(trades_file='backtest_trades_v5_late_only.csv', initial_ca
     
     # Sort by time
     df = df.sort_values('time').reset_index(drop=True)
+    
+    # Get SPY data for comparison
+    start_date = df['time'].iloc[0].strftime('%Y-%m-%d')
+    end_date = df['time'].iloc[-1].strftime('%Y-%m-%d')
+    
+    print(f"Downloading SPY data from {start_date} to {end_date}...")
+    spy = yf.Ticker('SPY')
+    spy_data = spy.history(start=start_date, end=end_date)
+    spy_prices = spy_data['Close']
+    
+    # Calculate SPY returns
+    spy_initial = spy_prices.iloc[0]
+    spy_returns = ((spy_prices / spy_initial - 1) * 100).values  # Convert to percentage
+    spy_dates = spy_prices.index
     
     # Initialize tracking variables
     cash = initial_capital
@@ -58,31 +73,25 @@ def plot_equity_curve(trades_file='backtest_trades_v5_late_only.csv', initial_ca
         times.append(row['time'])
     
     # Create figure
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(14, 7))
     
-    # Plot equity curve
-    plt.plot(times, equity_curve, color='#2E86AB', linewidth=2.5)
+    # Calculate strategy returns
+    strategy_returns = [(eq / initial_capital - 1) * 100 for eq in equity_curve]  # Convert to percentage
     
-    # Add initial capital line
-    plt.axhline(y=initial_capital, color='gray', linestyle='--', alpha=0.5, label=f'Initial: ${initial_capital:,.0f}')
+    # Plot returns
+    plt.plot(times, strategy_returns, color='#FF6B6B', linewidth=2.5, label='Strategy Return')
+    plt.plot(spy_dates, spy_returns, color='#4ECDC4', linewidth=2.5, label='SPY Return')
     
-    # Fill area under curve
-    equity_array = np.array(equity_curve)
-    times_array = np.array(times)
-    plt.fill_between(times_array, equity_array, initial_capital, 
-                     where=(equity_array >= initial_capital), 
-                     color='green', alpha=0.1, interpolate=True)
-    plt.fill_between(times_array, equity_array, initial_capital, 
-                     where=(equity_array < initial_capital), 
-                     color='red', alpha=0.1, interpolate=True)
+    # Add zero line for reference
+    plt.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=1)
     
     # Format
     plt.xlabel('Date', fontsize=12)
-    plt.ylabel('Total Equity ($)', fontsize=12)
-    plt.title('V5 Strategy - Total Equity Over Time\n(Trading Only After 15:45)', fontsize=14, pad=15)
+    plt.ylabel('Return (%)', fontsize=12)
+    plt.title('V5 Strategy vs SPY - Returns Comparison\n', fontsize=14, pad=15)
     
     # Format y-axis
-    plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
+    plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:+.1f}%'))
     
     # Format x-axis
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
@@ -90,6 +99,9 @@ def plot_equity_curve(trades_file='backtest_trades_v5_late_only.csv', initial_ca
     
     # Grid
     plt.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+    
+    # Add legend
+    plt.legend(loc='upper left', fontsize=11)
     
     # Calculate final metrics
     final_equity = equity_curve[-1]
@@ -107,10 +119,16 @@ def plot_equity_curve(trades_file='backtest_trades_v5_late_only.csv', initial_ca
         if drawdown > max_drawdown:
             max_drawdown = drawdown
     
+    # Calculate SPY metrics
+    spy_final_return = spy_returns[-1] if len(spy_returns) > 0 else 0
+    excess_return = total_return - spy_final_return
+    
     # Add statistics box
     stats_text = f'Initial Capital: ${initial_capital:,.0f}\n'
     stats_text += f'Final Equity: ${final_equity:,.0f}\n'
-    stats_text += f'Total Return: {total_return:+.2f}%\n'
+    stats_text += f'Strategy Return: {total_return:+.2f}%\n'
+    stats_text += f'SPY Return: {spy_final_return:+.2f}%\n'
+    stats_text += f'Excess Return: {excess_return:+.2f}%\n'
     stats_text += f'Max Drawdown: -{max_drawdown:.2f}%\n'
     stats_text += f'Min Equity: ${min_equity:,.0f}\n'
     stats_text += f'Max Equity: ${max_equity:,.0f}'
@@ -120,9 +138,11 @@ def plot_equity_curve(trades_file='backtest_trades_v5_late_only.csv', initial_ca
     plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes, fontsize=10,
              verticalalignment='top', bbox=props, family='monospace')
     
-    # Add final value annotation
-    plt.text(times[-1], final_equity, f'  ${final_equity:,.0f}\n  ({total_return:+.1f}%)', 
-             verticalalignment='center', fontsize=10, color='darkblue', weight='bold')
+    # Add final return annotations
+    plt.text(times[-1], strategy_returns[-1], f'  {strategy_returns[-1]:+.1f}%', 
+             verticalalignment='center', fontsize=10, color='#FF6B6B', weight='bold')
+    plt.text(spy_dates.tolist()[-1], spy_returns[-1], f'  {spy_returns[-1]:+.1f}%', 
+             verticalalignment='center', fontsize=10, color='#4ECDC4', weight='bold')
     
     # Tight layout
     plt.tight_layout()
@@ -138,6 +158,10 @@ def plot_equity_curve(trades_file='backtest_trades_v5_late_only.csv', initial_ca
     print(f"Max: ${max_equity:,.2f}")
     print(f"Final: ${final_equity:,.2f}")
     print(f"Max Drawdown: {max_drawdown:.2f}%")
+    print(f"\nPerformance comparison:")
+    print(f"Strategy Return: {total_return:+.2f}%")
+    print(f"SPY Return: {spy_final_return:+.2f}%")
+    print(f"Excess Return: {excess_return:+.2f}%")
     
     # Show plot
     plt.show()
