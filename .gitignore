@@ -85,3 +85,5 @@ nohup.out
 .mypy_cache/
 .dmypy.json
 dmypy.json 
+
+stock_data_csv_min/

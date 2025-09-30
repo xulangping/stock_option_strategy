@@ -131,6 +131,38 @@ def MA_Bullish_Signal(symbol, date, combined_df):
         return False    
     return ma5 > ma10 > ma20
 
+class DynamicStopLoss:
+    """动态止损策略类"""
+    
+    def __init__(self, initial_stop_loss: float = 0.05):
+        """
+        初始化动态止损策略
+        
+        参数:
+        initial_stop_loss: 初始止损比例，默认5%
+        """
+        self.initial_stop_loss = initial_stop_loss
+        self.stop_loss_levels = {}
+        
+    def calculate_trailing_stop(self, entry_price: float, current_price: float, 
+                              highest_price: float, trail_percent: float = 0.03) -> float:
+        """
+        移动止损/跟踪止损
+        
+        参数:
+        entry_price: 入场价格
+        current_price: 当前价格
+        highest_price: 入场后的最高价
+        trail_percent: 跟踪百分比
+        
+        返回:
+        止损价格
+        """
+        if highest_price > entry_price:
+            return highest_price * (1 - trail_percent)
+        else:
+            return entry_price * (1 - self.initial_stop_loss)
+
 
 if __name__ == "__main__":
     dir_path = r"daily/"
