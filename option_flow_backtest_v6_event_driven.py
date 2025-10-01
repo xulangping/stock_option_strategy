@@ -13,8 +13,12 @@ import os
 import pytz
 import warnings
 import heapq
+import re
 from dataclasses import dataclass
 warnings.filterwarnings('ignore')
+
+# Import position calculation function
+from stock_filter import calculate_position_size
 
 
 @dataclass
@@ -47,11 +51,13 @@ class Event:
 
 class SignalEvent(Event):
     """Option flow signal event"""
-    def __init__(self, signal_time: datetime, symbol: str, option_premium: float, priority: int = 1):
+    def __init__(self, signal_time: datetime, symbol: str, option_premium: float, 
+                 option_chain_id: str = '', priority: int = 1):
         super().__init__(time=signal_time, priority=priority)
         self.signal_time = signal_time
         self.symbol = symbol
         self.option_premium = option_premium
+        self.option_chain_id = option_chain_id
 
 
 class MarketUpdateEvent(Event):
@@ -74,17 +80,19 @@ class OptionFlowBacktestV6:
         # Market data cache: {symbol: DataFrame with datetime index}
         self.market_data: Dict[str, pd.DataFrame] = {}
         
-        # Strategy parameters
-        self.max_daily_trades = 4
-        self.max_daily_position = 0.80
-        self.min_cash_ratio = 0.20
-        self.take_profit = 0.25
-        self.stop_loss = -0.1
+        # Strategy parameters  
+        self.max_daily_trades = 5
+        self.max_daily_position = 0.99
+        self.min_cash_ratio = -0.5  # Allow leverage: cash can go to -50% of total assets
+        self.max_leverage = 1.45  # Max 1.45x leverage (留5%buffer应对价格波动)
+        self.take_profit = 0.2
+        self.stop_loss = -0.05
         self.holding_days = holding_days
-        self.blacklist_days = 5
-        self.entry_delay = 5
+        self.blacklist_days = 15
+        self.entry_delay = 2
         self.trade_start_time = (15, 30)
-        
+        self.min_option_premium = 100000  # 100K threshold
+        self.max_single_position = 0.3
         # Stocks to skip
         self.skip_stocks = {}
         
@@ -99,6 +107,19 @@ class OptionFlowBacktestV6:
     def calculate_commission(self, shares: int) -> float:
         """Calculate trading commission"""
         return max(shares * self.commission_per_share, self.min_commission)
+    
+    def extract_expiration_from_option_id(self, option_chain_id: str) -> Optional[datetime]:
+        """Extract expiration date from option chain ID
+        Format: GE230421C00100000 -> 2023-04-21
+        """
+        match = re.search(r'[A-Z]+([0-9]{6})[CP]', option_chain_id)
+        if match:
+            date_str = match.group(1)
+            year = int('20' + date_str[:2])
+            month = int(date_str[2:4])
+            day = int(date_str[4:6])
+            return datetime(year, month, day)
+        return None
         
     def convert_option_time_to_market_time(self, date_str: str, time_str: str) -> datetime:
         """Convert UTC+8 (Beijing time) to ET (New York time) and handle date adjustment"""
@@ -234,7 +255,7 @@ class OptionFlowBacktestV6:
         self.trades_history.append(trade)
     
     def can_open_position(self, date: datetime.date, symbol: str) -> bool:
-        """Check if we can open new position"""
+        """Check if we can open new position (with leverage support)"""
         # Check if already have position
         if symbol in self.positions:
             return False
@@ -243,14 +264,13 @@ class OptionFlowBacktestV6:
         if date in self.daily_trades and self.daily_trades[date] >= self.max_daily_trades:
             return False
         
-        # Check cash
-        if self.cash <= 0:
-            return False
-        
-        # Check cash ratio
+        # Check leverage limit (cash ratio can be negative)
         total_portfolio_value = self.cash + sum(pos.shares * pos.entry_price for pos in self.positions.values())
-        min_cash_required = total_portfolio_value * self.min_cash_ratio
-        if self.cash < min_cash_required:
+        cash_ratio = self.cash / total_portfolio_value if total_portfolio_value > 0 else 0
+        
+        # Allow negative cash down to min_cash_ratio (e.g., -50%)
+        if cash_ratio < self.min_cash_ratio:
+            print(f"  Skipping - leverage limit reached (cash ratio {cash_ratio:.1%} < {self.min_cash_ratio:.1%})")
             return False
         
         # Check blacklist
@@ -260,46 +280,71 @@ class OptionFlowBacktestV6:
         return True
     
     def check_position_exits(self, current_time: datetime):
-        """Check all positions for exit conditions"""
+        """Check all positions for exit conditions
+        
+        IMPORTANT: This checks positions at current_time, but also closes any positions
+        that should have been closed before current_time (in case of missing signals)
+        """
         positions_to_close = []
         
         for symbol, pos in self.positions.items():
             if symbol not in self.market_data:
                 continue
             
-            # Get current price
-            current_price = self.get_price_at_time(symbol, current_time)
-            if current_price is None:
-                continue
+            # Check if position should have been closed before current_time
+            # This handles the case where there were no signals between entry and planned exit
+            exit_time = current_time
             
-            # Update highest price
-            if current_price > pos.highest_price:
-                pos.highest_price = current_price
+            # If current_time is past the planned exit date, use the planned exit date
+            if current_time.date() > pos.planned_exit_date.date():
+                # Position should have been closed on planned_exit_date
+                # Find the price at planned_exit_date 15:00
+                exit_time = pos.planned_exit_date
+                current_price = self.get_price_at_time(symbol, exit_time)
+                if current_price is None:
+                    # If no data at exact time, use current_time price as fallback
+                    exit_time = current_time
+                    current_price = self.get_price_at_time(symbol, current_time)
+                    if current_price is None:
+                        continue
+            else:
+                # Normal case: check at current_time
+                current_price = self.get_price_at_time(symbol, current_time)
+                if current_price is None:
+                    continue
+            
+            # Update highest price (scan all prices from entry to exit_time)
+            df = self.market_data[symbol]
+            price_data = df[(df.index >= pos.entry_time) & (df.index <= exit_time)]
+            if len(price_data) > 0:
+                max_price = price_data['close'].max()
+                if max_price > pos.highest_price:
+                    pos.highest_price = max_price
             
             returns = (current_price - pos.entry_price) / pos.entry_price
             
             # Check stop loss
             if returns <= self.stop_loss:
-                positions_to_close.append((symbol, current_price, 'STOP_LOSS', returns))
+                positions_to_close.append((symbol, exit_time, current_price, 'STOP_LOSS', returns))
                 continue
             
             # Check take profit
             if returns >= self.take_profit:
-                positions_to_close.append((symbol, current_price, 'TAKE_PROFIT', returns))
+                positions_to_close.append((symbol, exit_time, current_price, 'TAKE_PROFIT', returns))
                 continue
             
             # Check holding period exit
             if (current_time.date() >= pos.planned_exit_date.date() and 
                 current_time.hour >= 15):
-                positions_to_close.append((symbol, current_price, 'HOLDING_PERIOD_EXIT', returns))
+                positions_to_close.append((symbol, exit_time, current_price, 'HOLDING_PERIOD_EXIT', returns))
                 continue
         
         # Execute closes
-        for symbol, price, reason, returns in positions_to_close:
+        for symbol, exit_time, price, reason, returns in positions_to_close:
             pos = self.positions[symbol]
-            actual_holding_days = (current_time.date() - pos.entry_time.date()).days
-            print(f"  [{reason}] {symbol}: {pos.shares} shares @ ${price:.2f} at {current_time} (Return: {returns:.2%}, Held: {actual_holding_days} days)")
-            self.execute_trade(symbol, current_time, reason, price, pos.shares)
+            actual_holding_days = (exit_time.date() - pos.entry_time.date()).days
+            print(f"  [{reason}] {symbol}: {pos.shares} shares @ ${price:.2f} at {exit_time} (Return: {returns:.2%}, Held: {actual_holding_days} days)")
+            self.execute_trade(symbol, exit_time, reason, price, pos.shares)
             del self.positions[symbol]
     
     def process_signal(self, signal: SignalEvent):
@@ -307,10 +352,24 @@ class OptionFlowBacktestV6:
         symbol = signal.symbol
         signal_time = signal.signal_time
         option_premium = signal.option_premium
+        option_chain_id = signal.option_chain_id
         
         print(f"\n{'='*60}")
         print(f"Signal: {symbol} at {signal_time}")
-        print(f"  Option premium: ${option_premium:,.0f}")
+        
+        # Calculate DTE from option_chain_id
+        dte = 0  # Default DTE
+        if option_chain_id:
+            expiration_date = self.extract_expiration_from_option_id(option_chain_id)
+            if expiration_date:
+                signal_date = signal_time.date()
+                dte = (expiration_date.date() - signal_date).days
+        
+        print(f"  Option premium: ${option_premium:,.0f}, DTE: {dte}")
+        
+        if option_premium < self.min_option_premium:
+            print(f"  Skipping - option premium ${option_premium:,.0f} below threshold ${self.min_option_premium:,.0f}")
+            return
         
         # Skip if in skip list
         if symbol in self.skip_stocks:
@@ -348,38 +407,55 @@ class OptionFlowBacktestV6:
             return
         entry_time = entry_data.index[0]
         
-        # Calculate position size
-        position_pct_of_initial = min(option_premium / 800000, 0.4)
+        # Calculate current total portfolio value
+        current_total_assets = self.cash + sum(pos.shares * pos.entry_price for pos in self.positions.values())
         
-        # Check daily position limit
+        # Calculate position size using the unified function (as % of current assets)
+        position_pct = calculate_position_size(
+            option_premium=option_premium,
+            dte=dte,                   # Pass actual DTE
+            premium_divisor=800000,   # 2M divisor
+            max_position_pct=self.max_single_position,     
+            dte_weight=False           # Don't adjust by DTE in basic version
+        )
+        
+        # Check daily position limit based on current total assets
         todays_allocation = sum(trade['gross_value'] for trade in self.trades_history 
                                if trade['time'].date() == signal_time.date() and trade['action'] == 'BUY')
-        current_daily_position = todays_allocation / self.initial_capital
+        current_daily_position = todays_allocation / current_total_assets if current_total_assets > 0 else 0
         
         if current_daily_position >= self.max_daily_position:
-            print(f"  Daily position limit reached ({current_daily_position:.1%})")
+            print(f"  Daily position limit reached ({current_daily_position:.1%} of current assets)")
             return
         
         max_remaining_pct = self.max_daily_position - current_daily_position
-        if position_pct_of_initial > max_remaining_pct:
-            position_pct_of_initial = max_remaining_pct
+        if position_pct > max_remaining_pct:
+            position_pct = max_remaining_pct
+            print(f"  Adjusted position to {position_pct:.1%} to stay within daily limit")
         
-        # Calculate shares
-        position_value = self.initial_capital * position_pct_of_initial
-        if position_value > self.cash:
-            position_value = self.cash * 0.95
+        # Calculate position value in dollars (based on current total assets)
+        position_value = current_total_assets * position_pct
+        
+        # With leverage enabled, we don't limit by cash
+        # Instead, check if total leverage would exceed limit
+        total_cost = position_value * (1 + self.slippage) + self.calculate_commission(int(position_value / entry_price))
+        
+        # Check if this would exceed leverage limit
+        cash_after_buy = self.cash - total_cost
+        positions_value_after = sum(pos.shares * pos.entry_price for pos in self.positions.values()) + position_value
+        total_assets_after = cash_after_buy + positions_value_after
+        
+        # Calculate leverage ratio (positions / total_assets)
+        leverage_ratio = positions_value_after / total_assets_after if total_assets_after > 0 else 0
+        
+        if leverage_ratio > self.max_leverage:
+            print(f"  Skipping - would exceed max leverage ({leverage_ratio:.1%} > {self.max_leverage:.0%})")
+            return
         
         shares = int(position_value / entry_price)
         if shares == 0:
             print(f"  Position too small")
             return
-        
-        # Double-check cash
-        total_cost = shares * entry_price * (1 + self.slippage) + self.calculate_commission(shares)
-        if total_cost > self.cash:
-            shares = int((self.cash * 0.95) / (entry_price * (1 + self.slippage) + self.commission_per_share))
-            if shares <= 0:
-                return
         
         # Calculate planned exit
         planned_exit_date = self.calculate_exit_date(entry_time)
@@ -387,10 +463,15 @@ class OptionFlowBacktestV6:
         # Execute buy
         actual_buy_price = entry_price * (1 + self.slippage)
         actual_position_value = shares * entry_price
-        actual_position_pct = actual_position_value / self.initial_capital
+        actual_position_pct = actual_position_value / current_total_assets
+        
+        # Calculate final leverage after buy
+        final_cash = self.cash - (shares * actual_buy_price + self.calculate_commission(shares))
+        final_cash_ratio = final_cash / total_assets_after if total_assets_after > 0 else 0
         
         print(f"  [BUY] {symbol}: {shares} shares @ ${entry_price:.2f} (actual: ${actual_buy_price:.2f}) at {entry_time}")
-        print(f"       Position: {actual_position_pct:.1%}, Cost: ${total_cost:,.2f}, Cash before: ${self.cash:,.2f}")
+        print(f"       Position: {actual_position_pct:.1%} of assets (${current_total_assets:,.0f}), Cost: ${total_cost:,.2f}")
+        print(f"       Cash: ${self.cash:,.2f} → ${final_cash:,.2f} (ratio: {final_cash_ratio:.1%}), Leverage: {leverage_ratio:.2f}x")
         
         self.execute_trade(symbol, entry_time, 'BUY', entry_price, shares)
         
@@ -432,7 +513,8 @@ class OptionFlowBacktestV6:
             event = SignalEvent(
                 signal_time=row['market_time'],
                 symbol=row['underlying_symbol'],
-                option_premium=row['premium']
+                option_premium=row['premium'],
+                option_chain_id=row.get('option_chain_id', '')  # Get option_chain_id if exists
             )
             signal_events.append(event)
         
@@ -544,7 +626,7 @@ def main():
     import sys
     
     # Get holding days from command line
-    holding_days = 1
+    holding_days = 6
     if len(sys.argv) > 1:
         try:
             holding_days = int(sys.argv[1])

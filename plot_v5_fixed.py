@@ -19,7 +19,6 @@ Optimized version with configurable parameters
 """
 
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 import matplotlib.dates as mdates
@@ -31,7 +30,7 @@ import os
 # ============================================================================
 
 # 交易记录CSV文件路径（修改这里来绘制不同的回测结果）
-TRADES_FILE = 'backtest_trades_v6_ma_filter.csv'
+TRADES_FILE = 'backtest_trades_v6_event_driven.csv'
 
 # 输出图片文件名
 OUTPUT_IMAGE = 'equity_curve.png'
@@ -259,6 +258,66 @@ def plot_equity_curve():
     spy_final_return = spy_returns[-1] if len(spy_returns) > 0 else 0
     excess_return = total_return - spy_final_return
     
+    # Calculate yearly returns
+    yearly_returns = {}
+    yearly_spy_returns = {}
+    
+    # Create DataFrame for easier yearly analysis
+    equity_df = pd.DataFrame({'time': times, 'equity': equity_curve})
+    equity_df['year'] = equity_df['time'].dt.year
+    
+    # Get the first year of data
+    first_year = equity_df['year'].iloc[0]
+    
+    # Calculate returns for each year
+    for year in [2023, 2024, 2025]:
+        year_data = equity_df[equity_df['year'] == year]
+        if len(year_data) > 0:
+            # Determine start equity for the year
+            if year == first_year:
+                # For the first year, use the very first equity value (INITIAL_CAPITAL)
+                start_equity = equity_df.iloc[0]['equity']
+            else:
+                # For subsequent years, use Dec 31 of previous year
+                # Find the last equity value on or before Dec 31 of previous year
+                year_start_date = pd.Timestamp(f'{year}-01-01')
+                prev_data = equity_df[equity_df['time'] < year_start_date]
+                if len(prev_data) > 0:
+                    start_equity = prev_data.iloc[-1]['equity']
+                else:
+                    # If no data before this year, use first equity of the year
+                    start_equity = year_data.iloc[0]['equity']
+            
+            # End equity is the last equity value in the year
+            end_equity = year_data.iloc[-1]['equity']
+            
+            yearly_return = (end_equity - start_equity) / start_equity * 100
+            yearly_returns[year] = yearly_return
+            
+            # Calculate SPY return for the same period
+            # Use the same date range as equity calculation
+            if year == first_year:
+                spy_start_date = equity_df.iloc[0]['time']
+            else:
+                spy_start_date = pd.Timestamp(f'{year}-01-01')
+            
+            spy_end_date = year_data.iloc[-1]['time']
+            
+            # Get SPY price at start
+            spy_start_data = spy_prices[spy_prices.index <= spy_start_date]
+            if len(spy_start_data) > 0:
+                spy_start_price = spy_start_data.iloc[-1]
+            else:
+                # Fallback to first available price
+                spy_start_price = spy_prices.iloc[0]
+            
+            # Get SPY price at end
+            spy_end_data = spy_prices[spy_prices.index <= spy_end_date]
+            if len(spy_end_data) > 0:
+                spy_end_price = spy_end_data.iloc[-1]
+                spy_yearly_return = (spy_end_price - spy_start_price) / spy_start_price * 100
+                yearly_spy_returns[year] = spy_yearly_return
+    
     # Add statistics box
     stats_text = f'Initial Capital: ${INITIAL_CAPITAL:,.0f}\n'
     stats_text += f'Final Equity: ${final_equity:,.0f}\n'
@@ -288,16 +347,47 @@ def plot_equity_curve():
     print(f"Chart saved to: {OUTPUT_IMAGE}")
     
     # Print some debug info
-    print(f"\nEquity progression:")
+    print("\nEquity progression:")
     print(f"Initial: ${INITIAL_CAPITAL:,.2f}")
     print(f"Min: ${min_equity:,.2f}")
     print(f"Max: ${max_equity:,.2f}")
     print(f"Final: ${final_equity:,.2f}")
     print(f"Max Drawdown: {max_drawdown:.2f}%")
-    print(f"\nPerformance comparison:")
+    print("\nPerformance comparison:")
     print(f"Strategy Return: {total_return:+.2f}%")
     print(f"SPY Return: {spy_final_return:+.2f}%")
     print(f"Excess Return: {excess_return:+.2f}%")
+    
+    # Print yearly returns
+    print("\nYearly Returns:")
+    print("-" * 80)
+    print(f"{'Year':<10} {'Start Equity':<18} {'End Equity':<18} {'Strategy':<12} {'SPY':<12} {'Excess':<12}")
+    print("-" * 80)
+    
+    for year in [2023, 2024, 2025]:
+        year_data = equity_df[equity_df['year'] == year]
+        if len(year_data) > 0:
+            # Get start equity (same logic as in calculation)
+            if year == first_year:
+                start_eq = equity_df.iloc[0]['equity']
+            else:
+                year_start_date = pd.Timestamp(f'{year}-01-01')
+                prev_data = equity_df[equity_df['time'] < year_start_date]
+                if len(prev_data) > 0:
+                    start_eq = prev_data.iloc[-1]['equity']
+                else:
+                    start_eq = year_data.iloc[0]['equity']
+            
+            end_eq = year_data.iloc[-1]['equity']
+            
+            if year in yearly_returns:
+                strategy_ret = yearly_returns[year]
+                spy_ret = yearly_spy_returns.get(year, 0)
+                excess_ret = strategy_ret - spy_ret
+                print(f"{year:<10} ${start_eq:>15,.0f}  ${end_eq:>15,.0f}  {strategy_ret:>+10.2f}%  {spy_ret:>+10.2f}%  {excess_ret:>+10.2f}%")
+        else:
+            print(f"{year:<10} {'N/A':<18} {'N/A':<18} {'N/A':<12} {'N/A':<12} {'N/A':<12}")
+    print("-" * 80)
     
     # Show plot
     plt.show()
@@ -307,7 +397,7 @@ def main():
     print("="*70)
     print("Equity Curve Plotter - Optimized Version")
     print("="*70)
-    print(f"Configuration:")
+    print("Configuration:")
     print(f"  Trades file: {TRADES_FILE}")
     print(f"  Output image: {OUTPUT_IMAGE}")
     print(f"  Initial capital: ${INITIAL_CAPITAL:,}")

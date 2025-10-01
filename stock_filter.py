@@ -124,12 +124,60 @@ def get_x_day_average_close_from_combined(symbol, date, X, combined_df):
 
 
 def MA_Bullish_Signal(symbol, date, combined_df):
+    """Check if stock meets MA bullish criteria (MA5 > MA10 > MA20)"""
     ma5 = get_x_day_average_close_from_combined(symbol = symbol, date = date, X = 5, combined_df = combined_df)
     ma10 = get_x_day_average_close_from_combined(symbol = symbol, date = date, X = 10, combined_df = combined_df)
     ma20 = get_x_day_average_close_from_combined(symbol = symbol, date = date, X = 20, combined_df = combined_df)
     if ma5 is None or ma10 is None or ma20 is None:
         return False    
     return ma5 > ma10 > ma20
+
+
+def calculate_position_size(option_premium: float, dte: int, 
+                            premium_divisor: float = 2000000, 
+                            max_position_pct: float = 0.3,
+                            dte_weight: bool = False) -> float:
+    """
+    Calculate position size as percentage of initial capital based on option premium and DTE
+    
+    Args:
+        option_premium: Option premium value in dollars
+        dte: Days to expiration
+        premium_divisor: Divisor for premium (default 2M, higher = smaller positions)
+        max_position_pct: Maximum position size as percentage (default 30%)
+        dte_weight: Whether to adjust position size based on DTE (default False)
+        
+    Returns:
+        float: Position size as percentage of initial capital (0.0 to max_position_pct)
+        
+    Examples:
+        >>> calculate_position_size(1000000, 30)  # 1M premium, 30 days DTE
+        0.3  # 30% position (capped at max)
+        
+        >>> calculate_position_size(500000, 30)   # 500K premium, 30 days DTE
+        0.25  # 25% position
+    """
+    # Base position size from option premium
+    base_position_pct = option_premium / premium_divisor
+    
+    # Optional: Adjust based on DTE (closer to expiration = LARGER position)
+    if dte_weight and dte > 0:
+        # DTE越小，信号越强，仓位越大
+        if dte <= 7:
+            dte_factor = 1.3  # DTE <= 7天，增加30%仓位（信号强）
+        elif dte <= 14:
+            dte_factor = 1.2  # DTE <= 14天，增加20%仓位
+        elif dte <= 30:
+            dte_factor = 1.1  # DTE <= 30天，增加10%仓位
+        elif dte <= 60:
+            dte_factor = 1.0  # DTE 30-60天，不调整
+        else:
+            dte_factor = 0.8  # DTE > 60天，减少20%（信号较弱）
+        
+        base_position_pct *= dte_factor
+    
+    # Cap at maximum position size
+    return min(base_position_pct, max_position_pct)
 
 class DynamicStopLoss:
     """动态止损策略类"""
