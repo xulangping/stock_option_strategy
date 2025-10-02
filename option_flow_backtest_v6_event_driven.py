@@ -86,7 +86,7 @@ class OptionFlowBacktestV6:
         self.min_cash_ratio = -0.5  # Allow leverage: cash can go to -50% of total assets
         self.max_leverage = 1.45  # Max 1.45x leverage (留5%buffer应对价格波动)
         self.take_profit = 0.2
-        self.stop_loss = -0.05
+        self.stop_loss = -0.1
         self.holding_days = holding_days
         self.blacklist_days = 15
         self.entry_delay = 2

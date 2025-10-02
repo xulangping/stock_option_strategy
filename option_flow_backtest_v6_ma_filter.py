@@ -95,12 +95,12 @@ class OptionFlowBacktestV6MA:
         self.take_profit = 0.25
         self.stop_loss = -0.1
         self.holding_days = holding_days
-        self.blacklist_days = 5
+        self.blacklist_days = 15
         self.entry_delay = 5
         self.trade_start_time = (13, 00)
         
         # Filter parameters
-        self.min_option_premium = 100000  # 100K threshold
+        self.min_option_premium = 800000  # 100K threshold
         self.max_dte = 100  # Maximum days to expiration
         
         # Stocks to skip
